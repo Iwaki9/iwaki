@@ -54,8 +54,10 @@ def setup():
     ensure_dirs()
     download_logos()
 
+    # === Надёжная установка ffmpeg ===
     if not FFMPEG_BIN.exists():
         print("Устанавливаем ffmpeg с NVENC...")
+        success = False
         try:
             subprocess.run(['bash', '-c', '''
                 rm -rf /content/ffmpeg-bin /tmp/ffmpeg.tar.xz
@@ -63,13 +65,18 @@ def setup():
                 tar -xf /tmp/ffmpeg.tar.xz -C /content
                 mv /content/ffmpeg-n8.1* /content/ffmpeg-bin 2>/dev/null || true
             '''], check=True, timeout=300)
+            if FFMPEG_BIN.exists():
+                success = True
         except:
-            print("⚠️ Используем системный ffmpeg")
+            pass
+
+        if not success:
+            print("⚠️ BtbN не скачался — используем системный ffmpeg")
             os.makedirs('/content/ffmpeg-bin/bin', exist_ok=True)
-            subprocess.run(['ln', '-sf', '/usr/bin/ffmpeg', '/content/ffmpeg-bin/bin/ffmpeg'], check=False)
+            subprocess.run(['ln', '-sf', '/usr/bin/ffmpeg',  '/content/ffmpeg-bin/bin/ffmpeg'], check=False)
             subprocess.run(['ln', '-sf', '/usr/bin/ffprobe', '/content/ffmpeg-bin/bin/ffprobe'], check=False)
 
-    # === Важно: устанавливаем переменные окружения ===
+    # Обновляем переменные окружения
     set_env(DEFAULTS)
     os.environ['PATH'] = f'{FFMPEG_BIN.parent}:' + os.environ.get('PATH', '')
 
