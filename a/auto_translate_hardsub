@@ -78,7 +78,7 @@ def _gpu_monitor_loop(stop_event, interval: float) -> None:
                     parts = []
                     for line in r.stdout.strip().splitlines():
                         cols = [x.strip() for x in line.split(",")]
-                        if len(cols) >= 5: parts.append(f"GPU{cols[0]}: util={cols[1]}% NVENC={cols[2]}% vram={cols[4]}MB")
+                        if len(cols) >= 5: parts.append(f"GPU{cols[0]}: util={cols[1]}% NVENC={cols[2]}% NVDEC={cols[3]}% vram={cols[4]}MB")
                     gpu_str = " | ".join(parts)
             write_log(f"📊 SYSTEM -> CPU: {cpu_util}% | RAM: {ram_util}% | {gpu_str}")
         except Exception: pass
@@ -105,7 +105,8 @@ def gpu_monitor_release() -> None:
 def write_log(text: str) -> None:
     Ctx.log_path.parent.mkdir(parents=True, exist_ok=True)
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {text}"
-    with Ctx.log_path.open("a", encoding="utf-8") as f: f.write(line + "\n")
+    with Ctx.log_path.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
     print(line, flush=True)
 
 def update_heartbeat() -> None:
@@ -120,10 +121,24 @@ def run_checked(args: List[str], allow_non_zero: bool = False) -> subprocess.Com
     proc = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if proc.returncode != 0 and not allow_non_zero: 
         raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(args)}\n{proc.stderr}")
-    return proc  # Опечатка исправлена возвратом объекта процесса
+    return proc
 
 def ensure_commands_exist() -> None:
     if shutil.which(FFMPEG_PATH) is None or shutil.which(FFPROBE_PATH) is None: raise RuntimeError("FFmpeg/FFprobe не найдены.")
+
+def get_state_dir(parent: Path) -> Path:
+    p = parent / STATE_DIR_NAME
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+def validate_paths() -> None:
+    Ctx.video_dir.mkdir(parents=True, exist_ok=True)
+    Ctx.subtitle_dir.mkdir(parents=True, exist_ok=True)
+    Ctx.output_dir.mkdir(parents=True, exist_ok=True)
+    Ctx.log_dir.mkdir(parents=True, exist_ok=True)
+    Ctx.logo_dir.mkdir(parents=True, exist_ok=True)
+    get_state_dir(Ctx.output_dir)
+    get_state_dir(Ctx.subtitle_dir)
 
 def detect_encoder(preferred: str) -> str:
     if preferred == "libx264": return "libx264"
@@ -135,7 +150,8 @@ def detect_encoder(preferred: str) -> str:
 
 def get_media_size(path: Path) -> Tuple[int, int]:
     proc = run_checked([FFPROBE_PATH, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", str(path)])
-    w, h = proc.stdout.strip().split("x", 1)
+    raw = proc.stdout.strip()
+    w, h = raw.split("x", 1)
     return int(w), int(h)
 
 def get_video_codec(path: Path) -> str:
@@ -200,7 +216,6 @@ def render_one(video: Path, subtitle: Path, lang: str, output_base: Optional[str
     temp_sub = new_temp_subtitle_copy(subtitle)
     escaped_sub = escape_subtitle_path_for_filter(temp_sub)
 
-    # Исправление конфликта NVDEC: добавляем hwaccel_output_format nv12 для совместимости с libass
     decode_args = []
     if Ctx.encoder == "nvenc" and os.environ.get("DISABLE_HWACCEL", "0") != "1":
         if get_video_codec(video) in {"h264", "hevc", "vp9"}:
@@ -236,7 +251,6 @@ def render_one(video: Path, subtitle: Path, lang: str, output_base: Optional[str
         args += ["-c:a", "copy"] if USE_AUDIO_COPY else ["-c:a", "aac", "-b:a", "128k"]
         args.append(str(output_path))
 
-        # Перенаправляем лог ошибок во временный файл, чтобы прочесть при аварии
         with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".ffmpeg.err", encoding="utf-8") as err_file:
             err_path = err_file.name
 
@@ -286,9 +300,13 @@ def render_one(video: Path, subtitle: Path, lang: str, output_base: Optional[str
     finally:
         temp_sub.unlink(missing_ok=True); update_heartbeat()
 
+def iter_video_files() -> List[Path]:
+    if not Ctx.video_dir.exists(): return []
+    return [p for p in Ctx.video_dir.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS]
+
 def process_render_jobs() -> int:
     tasks = []
-    for video in [p for p in Ctx.video_dir.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS]:
+    for video in iter_video_files():
         base = workflow2_common_base(video.stem) if Ctx.naming == "workflow2" else video.stem
         for lang in Ctx.dest_langs:
             candidates = [s for s in Ctx.subtitle_dir.iterdir() if s.is_file() and s.name.lower().endswith(f".{lang}.srt") and workflow2_common_base(s.with_suffix("").stem).lower() == base.lower()] if Ctx.naming == "workflow2" else [Ctx.subtitle_dir / f"{base}.{lang}.srt"]
@@ -347,7 +365,6 @@ def main() -> None:
     render_started = 0
     if not args.skip_render:
         render_started = process_render_jobs()
-        # Если задачи были, но ни одна не выполнилась, принудительно возвращаем ошибку
         if tasks_found > 0 and render_started == 0:
             write_log("❌ ERROR: Рендер не смог запуститься. Завершение с ошибкой.")
             sys.exit(1)
