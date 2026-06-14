@@ -23,6 +23,7 @@ LOG_DIR   = WORKING / 'logs'
 FFMPEG_BIN     = WORKING / 'ffmpeg-bin' / 'bin' / 'ffmpeg'
 FFPROBE_BIN    = WORKING / 'ffmpeg-bin' / 'bin' / 'ffprobe'
 
+# Профиль по умолчанию
 DEFAULTS = {
     # SFTP
     'sftp_host': '23.95.52.229',
@@ -41,8 +42,8 @@ DEFAULTS = {
     'encoder':         'nvenc',
     'naming':          'workflow2',
     'render_parallel': 2,
-    'ffmpeg_threads':  'auto',   
-    'gpu_overlay':     False,    
+    'ffmpeg_threads':  'auto',   # 'auto' = cpu_count / render_parallel
+    'gpu_overlay':     False,    # True = накладывать логотип на GPU (overlay_cuda)
 
     # Google Drive parent ID
     'drive_parent_id': '1DoCzjatQBGQmUEycPRc5nYZPngRfCIfR',
@@ -54,11 +55,15 @@ DEFAULTS = {
     'logo_es':  None,
 }
 
+# =========================================================
+# Подготовка окружения
+# =========================================================
 def _ensure_dirs():
     for p in (SRC_DIR, VIDEO_DIR, SUBS_DIR, OUT_DIR, LOG_DIR, Path(LOGO_DIR_DEFAULT)):
         p.mkdir(parents=True, exist_ok=True)
 
 def _ensure_script(logo_dir: str) -> Path:
+    """Скрипт хардсаба должен лежать в /content/. Если нет — копируем из ассетов."""
     dst = WORKING / SCRIPT_NAME
     src = Path(logo_dir) / SCRIPT_NAME
     if not dst.exists():
@@ -91,7 +96,7 @@ def _set_env(profile: dict):
     if profile.get('gpu_overlay'):
         os.environ['USE_GPU_OVERLAY'] = '1'
     else:
-        os.environ.pop('USE_GPU_OVERLAY', None)
+        os.environ['USE_GPU_OVERLAY'] = '0'
 
     ldir = profile['logo_dir']
     os.environ['LOGO_EN'] = profile['logo_en'] or f'{ldir}/logo riki.png'
@@ -162,7 +167,7 @@ if [ -z "$FFMPEG_OK" ]; then
 fi
 
 if [ -z "$FFMPEG_OK" ]; then
-  echo '⚠️  НИ ОДНА ВЕРСИЯ FFMPEG НЕ ПОДДЕРЖИВАЕТ NVENC'
+  echo '⚠️  НИ ОДНА ВЕРСИЯ FFMPEG НЕ ПОДДЕРЖИВАЕТ NVENC С ТЕКУЩИМ ДРАЙВЕРОМ'
   echo '   Используй CPU-кодировщик: kp.run(..., encoder="libx264")'
 fi
 
@@ -174,7 +179,7 @@ echo '>>> Скачивание логотипов с GitHub...'
 wget -q -O "/content/assets/logo riki.png" "https://raw.githubusercontent.com/Iwaki9/iwaki/refs/heads/master/a/logo%20riki.png"
 wget -q -O "/content/assets/logo.png" "https://raw.githubusercontent.com/Iwaki9/iwaki/refs/heads/master/a/logo.png"
 
-pip install -q pysrt transformers sentencepiece accelerate gdown requests nest_asyncio 2>&1 | tail -1
+pip install -q pysrt transformers sentencepiece accelerate gdown requests playwright nest_asyncio 2>&1 | tail -1
 if ! command -v lftp >/dev/null; then
   apt-get update -qq && apt-get install -y -qq lftp 2>&1 | tail -1
 fi
@@ -182,6 +187,7 @@ echo '>>> SETUP DONE'
 '''
 
 def setup():
+    """Один раз за сессию: ставит ffmpeg+NVENC, python-пакеты, lftp и качает логотипы."""
     print('=== SETUP ===')
     rc = subprocess.call(['bash', '-c', SETUP_SCRIPT])
     if rc != 0:
@@ -202,10 +208,22 @@ def _secrets():
         return None
 
 SECRET_DOCS = {
-    'UPLOAD_API_TOKEN': {'why': 'нужен для заливки через API', 'how': 'Добавьте в Secrets на панели слева'},
-    'SFTP_PASS': {'why': 'пароль для SFTP-сервера', 'how': 'Добавьте в Secrets на панели слева'},
-    'TG_BOT_TOKEN': {'why': 'токен Telegram-бота', 'how': 'Добавьте в Secrets на панели слева'},
-    'TG_CHAT_ID': {'why': 'твой Telegram chat_id', 'how': 'Добавьте в Secrets на панели слева'},
+    'UPLOAD_API_TOKEN': {
+        'why': 'нужен для заливки через API (upload="api")',
+        'how': 'Вкладка Secrets (иконка ключа) на левой панели Colab',
+    },
+    'SFTP_PASS': {
+        'why': 'пароль для SFTP-сервера (нужен только если upload="sftp")',
+        'how': 'Вкладка Secrets (иконка ключа) на левой панели Colab',
+    },
+    'TG_BOT_TOKEN': {
+        'why': 'токен Telegram-бота для уведомлений (опционально)',
+        'how': 'Вкладка Secrets (иконка ключа) на левой панели Colab',
+    },
+    'TG_CHAT_ID': {
+        'why': 'твой Telegram chat_id куда слать уведомления (опционально)',
+        'how': 'Вкладка Secrets (иконка ключа) на левой панели Colab',
+    },
 }
 
 def _check_secret(name: str, required: bool = True) -> bool:
@@ -223,13 +241,20 @@ def check_secrets(upload: str = 'api', with_telegram: bool = True, verbose: bool
     if 'sftp' in targets: needed.append('SFTP_PASS')
     if with_telegram: optional.extend(['TG_BOT_TOKEN', 'TG_CHAT_ID'])
 
-    missing_required = [s for s in needed if not _check_secret(s)]
-    missing_optional = [s for s in optional if not _check_secret(s)]
+    missing_required = []
+    missing_optional = []
 
     if 'dm' in targets:
         if not Path(DM_DEFAULTS['cookies_path']).exists():
-            print(f'❌ ОБЯЗАТЕЛЬНО для upload="dm": {DM_DEFAULTS["cookies_path"]} не найден')
+            print('❌ ОБЯЗАТЕЛЬНО для upload="dm":')
+            print(f'  • {DM_DEFAULTS["cookies_path"]} не найден')
+            print('      Создай его через: kp.save_dm_cookies("""... куки ...""")')
             missing_required.append('DM_COOKIES_FILE')
+
+    for s in needed:
+        if not _check_secret(s): missing_required.append(s)
+    for s in optional:
+        if not _check_secret(s): missing_optional.append(s)
 
     if verbose:
         if not missing_required and not missing_optional:
@@ -239,9 +264,17 @@ def check_secrets(upload: str = 'api', with_telegram: bool = True, verbose: bool
             if missing_required:
                 print(f'\n❌ ОБЯЗАТЕЛЬНЫЕ для upload="{upload}":')
                 for s in missing_required:
-                    print(f'  • {s} — {SECRET_DOCS.get(s, {}).get("why", "—")}')
-            print('\nКак добавить:\n  1. Левая панель → Иконка ключа (Secrets)\n  2. Имя = ключ, Значение = токен\n  3. Включите доступ для блокнота (Notebook Access)')
-
+                    info = SECRET_DOCS.get(s, {})
+                    print(f'  • {s}\n      Зачем: {info.get("why", "—")}')
+            if missing_optional:
+                print('\n⚠️  Опциональные (можно пропустить):')
+                for s in missing_optional:
+                    info = SECRET_DOCS.get(s, {})
+                    print(f'  • {s} — {info.get("why", "—")}')
+            print('\nКак добавить в Colab:')
+            print('  1. Левая панель → Иконка ключа (Secrets)')
+            print('  2. Add new secret → Имя (Label) и Значение (Value)')
+            print('  3. Обязательно включи чекбокс "Notebook access"!')
     return not missing_required
 
 def doctor(upload: str = 'api', logo_dir: Optional[str] = None) -> bool:
@@ -250,25 +283,39 @@ def doctor(upload: str = 'api', logo_dir: Optional[str] = None) -> bool:
     profile = {**DEFAULTS}
     if logo_dir: profile['logo_dir'] = logo_dir
 
+    # 1. GPU
     try:
         r = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'], capture_output=True, text=True, timeout=10)
         if r.returncode == 0 and r.stdout.strip():
             print(f'✅ GPU: {r.stdout.strip()}')
         else:
-            print('❌ GPU не найден! Смените рантайм на T4 GPU.'); ok = False
+            print('❌ GPU не найден! Меню: Среда выполнения -> Сменить тип среды выполнения -> T4 GPU')
+            ok = False
     except Exception:
-        print('❌ GPU не подключен.'); ok = False
+        print('❌ nvidia-smi сбой — GPU не подключен')
+        ok = False
 
+    # 2. ffmpeg
     if FFMPEG_BIN.exists():
         r = subprocess.run([str(FFMPEG_BIN), '-hide_banner', '-encoders'], capture_output=True, text=True)
         if 'h264_nvenc' in (r.stdout or ''): print('✅ ffmpeg c NVENC установлен')
-        else: print('⚠️  h264_nvenc не найден.'); ok = False
+        else: print('⚠️  ffmpeg есть, но h264_nvenc не найден. Запусти kp.setup() заново'); ok = False
     else:
-        print('❌ ffmpeg не установлен. Вызовите kp.setup()'); ok = False
+        print('❌ ffmpeg не установлен. Запусти kp.setup()'); ok = False
 
-    src = Path(profile['logo_dir']) / SCRIPT_NAME
-    if src.exists(): print(f'✅ Скрипт хардсаба обнаружен: {src}')
-    else: print(f'⚠️  Скрипт {SCRIPT_NAME} еще не скопирован в рабочий каталог.'); ok = False
+    # 3. Логотипы
+    ldir = profile['logo_dir']
+    logo_files = {
+        'EN': profile['logo_en'] or f'{ldir}/logo riki.png',
+        'IT': profile['logo_it'] or f'{ldir}/logo.png',
+        'ES': profile['logo_es'] or f'{ldir}/logo.png',
+    }
+    missing_logos = [f'{lang}: {p}' for lang, p in logo_files.items() if not Path(p).exists()]
+    if missing_logos:
+        print('⚠️  Некоторые логотипы не найдены:')
+        for m in missing_logos: print(f'   - {m}')
+    else:
+        print('✅ Логотипы на месте')
 
     print()
     if not check_secrets(upload=upload, with_telegram=True, verbose=True): ok = False
@@ -285,11 +332,25 @@ def tg_send(text: str, silent: bool = False):
         requests.post(f'https://api.telegram.org/bot{token}/sendMessage', data={'chat_id': chat, 'text': text, 'parse_mode': 'HTML', 'disable_notification': silent}, timeout=15)
     except Exception as e: print(f'[tg warn] {e}')
 
+# =========================================================
+# SFTP / API заливка
+# =========================================================
 def _sftp_upload(files: Sequence[Path], host, user, port, path, password):
     env = os.environ.copy()
     env.update(SFTP_HOST=host, SFTP_USER=user, SFTP_PORT=port, SFTP_PATH=path, SFTP_PASS=password)
     src_list = ' '.join(f'"{f}"' for f in files)
-    cmd = f'lftp -u "$SFTP_USER,$SFTP_PASS" -p "$SFTP_PORT" "sftp://$SFTP_HOST" <<EOF\nset sftp:auto-confirm yes\nmkdir -p $SFTP_PATH\ncd $SFTP_PATH\nmput -P 2 {src_list}\nbye\nEOF'
+    cmd = f'''
+lftp -u "$SFTP_USER,$SFTP_PASS" -p "$SFTP_PORT" "sftp://$SFTP_HOST" <<EOF
+set sftp:auto-confirm yes
+set net:max-retries 3
+set net:reconnect-interval-base 5
+set xfer:clobber on
+mkdir -p $SFTP_PATH
+cd $SFTP_PATH
+mput -P 2 {src_list}
+bye
+EOF
+'''
     rc = subprocess.call(['bash', '-c', cmd], env=env)
     return (len(files), []) if rc == 0 else (0, list(files))
 
@@ -305,20 +366,42 @@ def _api_upload(fpath: Path, server, hostings, token, speed_limit_mbps=2, speed_
         args += [f'{server}/api/upload']
         try:
             r = subprocess.run(args, capture_output=True, text=True, timeout=7200)
-        except subprocess.TimeoutExpired: return False, 'timeout'
+        except subprocess.TimeoutExpired:
+            print(f'  [{attempt}/{max_retries}] timeout >2h')
+            last = 'timeout'; continue
         dt = time.time() - t0
         speed = (size_mb * 8) / dt if dt > 0 else 0
 
-        if r.returncode == 0: return True, f'{speed:.1f} Mbps'
-        last = f'exit {r.returncode}'
-        time.sleep(5)
+        if r.returncode == 0:
+            resp = (r.stdout or '').strip()
+            print(f'  OK в {dt:.1f}s ({speed:.1f} Mbps) айтемпт {attempt}')
+            return True, f'{speed:.1f} Mbps, {dt:.0f}s'
+
+        if r.returncode == 28:
+            resp = (r.stdout or r.stderr or '').strip()
+            if resp and any(s in resp.lower() for s in ('"status":"ok"', '"success":true', 'uploaded', 'task_id')):
+                return True, f'{speed:.1f} Mbps, {dt:.0f}s (curl28 ok)'
+            last = f'slow/dropped ({speed:.1f} Mbps)'
+            time.sleep(5); continue
+
+        print(f'  [{attempt}/{max_retries}] FAIL exit={r.returncode}')
+        last = f'curl exit {r.returncode}'
+        if r.returncode in (6, 7, 18, 35, 52, 55, 56, 92):
+            time.sleep(10); continue
+        break
     return False, last
 
 def list_outputs(langs: Union[str, Iterable[str], None] = None) -> List[Path]:
     files = sorted(p for p in OUT_DIR.glob('*.mp4') if p.is_file())
     if not langs: return files
     langs_set = {x.strip().lower() for x in (langs.split(',') if isinstance(langs, str) else langs)}
-    return [f for f in files if f.stem.split('.')[-1].lower() in langs_set]
+    out = []
+    for f in files:
+        stem = f.stem
+        if '.' in stem:
+            _, lang = stem.rsplit('.', 1)
+            if lang.lower() in langs_set: out.append(f)
+    return out
 
 def _upload(files: Sequence[Path], targets: Sequence[str], **kw):
     res = {'sftp_ok': 0, 'sftp_fail': [], 'api_ok': 0, 'api_fail': []}
@@ -328,47 +411,69 @@ def _upload(files: Sequence[Path], targets: Sequence[str], **kw):
 
     if 'sftp' in targets:
         pw = sec.get_secret('SFTP_PASS')
+        print(f'\n--- SFTP -> {p["sftp_user"]}@{p["sftp_host"]}:{p["sftp_path"]} ---')
         ok, fail = _sftp_upload(files, p['sftp_host'], p['sftp_user'], p['sftp_port'], p['sftp_path'], pw)
         res['sftp_ok'] = ok; res['sftp_fail'] = [f.name for f in fail]
 
     if 'api' in targets:
         token = sec.get_secret('UPLOAD_API_TOKEN')
-        for f in files:
+        print(f'\n--- API -> {p["api_server"]}/api/upload ---')
+        for i, f in enumerate(files, 1):
+            mb = f.stat().st_size / 1024 / 1024
+            print(f'  [{i}/{len(files)}] {f.name} ({mb:.1f} MB)')
             ok, info = _api_upload(f, p['api_server'], p['api_hostings'], token, p['api_speed_limit_mbps'], p['api_speed_time_sec'], p['api_max_retries'])
             if ok: res['api_ok'] += 1
             else: res['api_fail'].append((f.name, info))
-            
+
     if 'dm' in targets:
+        print(f'\n--- DM -> Dailymotion ---')
         dm_res = upload_dm(files=[f.name for f in files])
         res['dm_ok'] = dm_res.get('dm_ok', 0); res['dm_fail'] = dm_res.get('dm_fail', [])
     return res
 
+# =========================================================
+# Разрешение структуры папок Google Drive
+# =========================================================
 def _resolve_drive_folder(folder: str, parent_id: Optional[str]) -> str:
     if folder.startswith('http') or (len(folder) >= 20 and '/' not in folder): return folder
-    if not parent_id: raise RuntimeError('drive_parent_id не задан.')
+    if not parent_id: raise RuntimeError('drive_parent_id не задан в DEFAULTS.')
     import re, urllib.request
     url = f'https://drive.google.com/drive/folders/{parent_id}'
+    print(f'🔍 Ищу подпапку "{folder}" в родительской папке {parent_id}...')
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=15) as r:
             html = r.read().decode('utf-8', errors='replace')
-    except Exception as e: raise RuntimeError(f'Ошибка сканирования родительской папки: {e}')
-    
+    except Exception as e: raise RuntimeError(f'Не удалось получить доступ к Drive: {e}')
+
     items = {}
+    def _clean_name(raw: str) -> str:
+        n = raw.strip().split(',', 1)[0].strip()
+        for suf in (' Shared folder', ' Shared Folder', ' Folder', ' folder'):
+            if n.endswith(suf): n = n[:-len(suf)].rstrip(); break
+        return n
+
     for m in re.finditer(r'<tr[^>]*\sdata-id="([0-9A-Za-z_-]{20,})"[^>]*>(.*?)</tr>', html, re.DOTALL):
         item_id, block = m.group(1), m.group(2)
         m2 = re.search(r'data-tooltip="([^"]+)"', block) or re.search(r'aria-label="([^"]+)"', block)
         if m2:
-            name = m2.group(1).split(',')[0].replace(' Shared folder','').replace(' Folder','').strip()
+            name = _clean_name(m2.group(1))
             items[name] = item_id
-            
-    if folder in items: return items[folder]
-    raise RuntimeError(f'Подпапка "{folder}" не найдена в каталоге Google Drive.')
+
+    if not items:
+        for m in re.finditer(r'"([0-9A-Za-z_-]{20,})"[^"]{0,200}?"([^"\\]+)"', html):
+            c_id, c_name = m.group(1), _clean_name(m.group(2))
+            if len(c_name) < 200 and '<' not in c_name and '\\' not in c_name: items.setdefault(c_name, c_id)
+
+    if folder in items:
+        print(f'✅ Найдена подпапка "{folder}": {items[folder]}')
+        return items[folder]
+    raise RuntimeError(f'Подпапка "{folder}" не найдена. Доступные папки: {list(items.keys())[:30]}')
 
 def run(*, folder: Optional[str] = None, folder_id: Optional[str] = None, langs: str = 'en', upload: str = 'api', **overrides):
     profile = {**DEFAULTS, **overrides}
     folder_arg = folder if folder is not None else folder_id
-    if not folder_arg: raise RuntimeError('Укажите параметр folder="номер"')
+    if not folder_arg: raise RuntimeError('Укажи folder="имя папки"')
 
     real_folder_id = _resolve_drive_folder(folder_arg, profile.get('drive_parent_id'))
     _ensure_dirs()
@@ -378,42 +483,57 @@ def run(*, folder: Optional[str] = None, folder_id: Optional[str] = None, langs:
     script = _ensure_script(profile['logo_dir'])
 
     targets = [t.strip().lower() for t in upload.split(',') if t.strip() if t != 'none']
-    tg_send(f'🎬 Colab: старт\nFolder: <b>{folder_arg}</b>\nLangs: <b>{langs}</b>', silent=True)
+    tg_send(f'🎬 Colab: старт пайплайна\nFolder: <b>{folder_arg}</b>\nLangs: <b>{langs}</b>\nUpload: <b>{upload}</b>', silent=True)
     t_total = time.time()
 
-    print('=== 1/4 Скачивание из Google Drive ===')
+    print(f'=== 1/4 Скачивание папки из Google Drive ===')
     import gdown
     gdown.download_folder(id=real_folder_id, output=str(SRC_DIR), quiet=False, use_cookies=False)
     for f in SRC_DIR.rglob('*'):
         if not f.is_file(): continue
-        if f.suffix.lower() in {'.mp4', '.mkv', '.avi', '.mov'}: shutil.copy2(f, VIDEO_DIR / f.name)
-        elif f.suffix.lower() == '.srt': shutil.copy2(f, SUBS_DIR / f.name)
+        ext = f.suffix.lower()
+        if ext in {'.mp4', '.mkv', '.avi', '.mov'}: shutil.copy2(f, VIDEO_DIR / f.name)
+        elif ext == '.srt': shutil.copy2(f, SUBS_DIR / f.name)
 
-    print('\n=== 2/4 Рендер хардсаба ===')
+    print(f'\n=== 2/4 Запуск рендера хардсаба ===')
     t_render = time.time()
-    rc = subprocess.call(['python', str(script), '--once', '--video-dir', str(VIDEO_DIR), '--subtitle-dir', str(SUBS_DIR), '--logo-dir', profile['logo_dir'], '--output-dir', str(OUT_DIR), '--log-dir', str(LOG_DIR), '--dest-langs', langs, '--encoder', profile['encoder'], '--naming', profile['naming'], '--skip-translation'])
-    if rc != 0: tg_send('❌ Colab: рендер завершился ошибкой'); raise RuntimeError('Рендер упал')
-    
+    rc = subprocess.call([
+        'python', str(script), '--once',
+        '--video-dir',    str(VIDEO_DIR),
+        '--subtitle-dir', str(SUBS_DIR),
+        '--logo-dir',     profile['logo_dir'],
+        '--output-dir',   str(OUT_DIR),
+        '--log-dir',      str(LOG_DIR),
+        '--dest-langs',   langs,
+        '--encoder',      profile['encoder'],
+        '--naming',       profile['naming'],
+        '--skip-translation',
+    ])
+    if rc != 0: tg_send('❌ Colab: Рендер упал!'); raise RuntimeError(f'Hardsub failed, exit={rc}')
     outputs = list_outputs()
     tg_send(f'✅ Рендер готов за {(time.time()-t_render)/60:.1f} мин ({len(outputs)} файлов)', silent=True)
 
-    print('\n=== 3/4 Заливка видео ===')
+    print(f'\n=== 3/4 Заливка на сервера ===')
     res = _upload(outputs, targets, **profile)
 
     total_dt = (time.time() - t_total) / 60
-    lines = [f'🏁 Colab: Пайплайн выполнен за <b>{total_dt:.1f} мин</b>', f'API: ✅ {res.get("api_ok",0)}, SFTP: ✅ {res.get("sftp_ok",0)}']
+    lines = [f'🏁 Colab: Всё готово за <b>{total_dt:.1f} мин</b>']
+    if 'api' in targets: lines.append(f'API: ✅ {res["api_ok"]}/{len(outputs)}')
+    if 'sftp' in targets: lines.append(f'SFTP: ✅ {res["sftp_ok"]}/{len(outputs)}')
     tg_send('\n'.join(lines))
-    print('\n'.join(lines))
+    print('\n=== 4/4 DONE ===')
     return res
 
 def retry(*, langs: Optional[str] = None, files: Optional[List[str]] = None, upload: str = 'api', **overrides):
     profile = {**DEFAULTS, **overrides}
     targets = [t.strip().lower() for t in upload.split(',') if t.strip()]
     flist = [OUT_DIR / n for n in files if (OUT_DIR / n).exists()] if files else list_outputs(langs)
+    print(f'Файлов на повтор: {len(flist)}')
     return _upload(flist, targets, **profile)
 
 def stop():
-    tg_send('🛑 Colab: Выключение виртуальной машины рантайма.')
+    """Полное завершение инстанса рантайма Colab (высвобождает Compute Units мгновенно)"""
+    tg_send('🛑 Colab: Пайплайн завершен. Отключаю виртуальную машину рантайма.')
     time.sleep(2)
     try:
         from google.colab import runtime
@@ -426,49 +546,168 @@ def show_log(n: int = 100):
     if log.exists(): subprocess.run(['tail', '-n', str(n), str(log)])
 
 # =========================================================
-# DAILYMOTION SECTION
+# DAILYMOTION UPLOADER
 # =========================================================
-DM_DEFAULTS = {'cookies_path': '/content/cookies.json', 'category': 'TV', 'description': 'Автоматическая загрузка из Colab', 'visibility': 'private', 'kids': False}
-LANG_NAMES = {'en': 'english', 'it': 'italian', 'es': 'spanish', 'ru': 'russian'}
+DM_DEFAULTS = {
+    'cookies_path': '/content/cookies.json',
+    'category':     'TV',
+    'description':  'Автоматическая загрузка из Google Colab',
+    'visibility':   'private',
+    'kids':         False,
+}
+
+LANG_NAMES = {'en': 'english', 'it': 'italian', 'es': 'spanish', 'ru': 'russian', 'fr': 'french', 'de': 'german', 'tr': 'turkish'}
 
 def save_dm_cookies(raw_cookies_text: str, out_path: str = None) -> str:
     import json, re
     out_path = out_path or DM_DEFAULTS['cookies_path']
     cleaned = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', raw_cookies_text)
-    cleaned = re.sub(r'\{"name":"g_state".*?(?=\{"name"|\}\])', '', cleaned).strip()
+    cleaned = re.sub(r'\{"name":"g_state".*?(?=\{"name"|\}\])', '', cleaned).replace(',,', ',').replace('[,', '[').replace(',]', ']').strip()
     parsed = json.loads(cleaned)
+    for c in parsed:
+        for k in ('storeId', 'firstPartyDomain', 'partitionKey'): c.pop(k, None)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, 'w') as f: json.dump(parsed, f, indent=4)
-    print(f'✅ Cookies сохранены в {out_path}')
+    with open(out_path, 'w', encoding='utf-8') as f: json.dump(parsed, f, indent=4)
+    print(f'✅ Cookies сохранены: {out_path}')
     return out_path
 
 def _dm_make_title(file_stem: str) -> str:
     import re
-    return f"{file_stem} subtitles"
+    match = re.match(r'^(?P<base>.+)\.(?P<lang>[a-zA-Z]{2,3})$', file_stem)
+    base, lang_code = (match.group('base'), match.group('lang').lower()) if match else (file_stem, '')
+    lang_name = LANG_NAMES.get(lang_code, lang_code)
+    ep_num, show = None, base
+
+    m = re.search(r'(\d+)\.\s*Bölüm', base, re.IGNORECASE) or re.search(r'Bölüm\s*(\d+)', base, re.IGNORECASE) or re.search(r'(?:Episode|Ep)\.?\s*(\d+)', base, re.IGNORECASE) or re.search(r'S\d+E(\d+)', base, re.IGNORECASE) or re.search(r'[｜|]\s*(\d+)\s*\.', base)
+    if m:
+        ep_num = m.group(1)
+        show = base[:m.start()].strip() if 'Bölüm' in m.group(0) or '｜' in m.group(0) else (base[:m.start()] + base[m.end():]).strip()
+
+    show = re.sub(r'[\s\.\-_｜|]+$', '', show).strip()
+    parts = [show]
+    if ep_num: parts.append(f'episode {ep_num}')
+    if lang_name: parts.append(f'{lang_name} subtitles')
+    return ' '.join(parts).strip()[:255]
+
+def _get_video_duration(path: str) -> float:
+    try:
+        r = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', path], capture_output=True, text=True)
+        return float(r.stdout.strip())
+    except Exception: return 0.0
+
+def _trim_video_if_needed(path: str, limit_sec: int = 7200) -> str:
+    import random
+    dur = _get_video_duration(path)
+    if dur <= limit_sec: return path
+    target = 7140 + random.randint(10, 40)
+    p = Path(path)
+    out = p.with_name(f'{p.stem}_trimmed{p.suffix}')
+    print(f'✂️ Видео длиннее 2 часов ({int(dur)}s) -> режем до {target}s')
+    subprocess.run(['ffmpeg', '-y', '-i', path, '-t', str(target), '-c', 'copy', str(out)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return str(out) if out.exists() else path
 
 async def _dm_upload_one_async(file_path: str, title: str, description: str, category: str, cookies_file: str, visibility: str, kids: bool):
     import json
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
-        context = await browser.new_context()
+        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process'])
+        context = await browser.new_context(viewport={'width': 1280, 'height': 720})
         with open(cookies_file) as f: raw = json.load(f)
         await context.add_cookies([{'name': c['name'], 'value': c['value'], 'domain': c['domain'], 'path': c['path']} for c in raw])
         page = await context.new_page()
+        print(f'→ Подключаюсь к DM для "{title}"...')
         await page.goto('https://www.dailymotion.com/partner/media/video?upload=true', timeout=60000)
-        file_input = page.locator("input[type='file']")
-        await file_input.first.set_input_files(file_path)
-        await asyncio.sleep(10)
-        await page.locator('input#title').fill(title[:255])
-        await page.locator("button:has-text('Next')").first.click(force=True)
-        await asyncio.sleep(2)
-        await page.locator("button:has-text('Save')").first.click(force=True)
-        await browser.close()
+        await page.wait_for_load_state('networkidle')
+        await asyncio.sleep(5)
 
-def upload_dm(**kw):
+        if 'login' in page.url or 'signin' in page.url: raise RuntimeError('Cookies протухли!')
+
+        file_input = page.locator("input[type='file']")
+        if await file_input.count() > 0: await file_input.first.set_input_files(file_path)
+        else:
+            async with page.expect_file_chooser() as fc: await page.locator('button, div').filter(has_text='Select files').first.click()
+            await (await fc.value).set_files(file_path)
+
+        await asyncio.sleep(15)
+        await page.locator('input#title').fill(title[:255])
+        await page.locator('textarea#description').fill(description[:3000])
+
+        cat_block = page.locator('label', has_text='Category').locator('xpath=../..')
+        await cat_block.locator('.ant-select-selector').first.click(force=True)
+        await asyncio.sleep(1.5)
+        found = False
+        for _ in range(25):
+            active = page.locator('.ant-select-item-option-active')
+            if await active.count() > 0 and (await active.first.get_attribute('title')) == category:
+                await page.keyboard.press('Enter'); found = True; break
+            await page.keyboard.press('ArrowDown'); await asyncio.sleep(0.3)
+        if not found: raise RuntimeError(f'Не найдена категория: {category}')
+
+        await asyncio.sleep(2)
+        await page.locator("button:has-text('Next')").first.click(force=True)
+        await asyncio.sleep(3)
+        await page.locator(f"input[name='is_created_for_kids'][value='{'true' if kids else 'false'}']").locator('..').click(force=True)
+        await page.locator("button:has-text('Next')").first.click(force=True)
+        await asyncio.sleep(3)
+        await page.locator(f"input[name='visibility'][value='{visibility}']").locator('..').click(force=True)
+
+        print('  Ожидание обработки на DM (до 2 часов)...')
+        waited, max_wait = 0, 7200
+        while waited < max_wait:
+            badges = page.locator("div[class*='infoText']")
+            uploading = False
+            for i in range(await badges.count()):
+                t = (await badges.nth(i).inner_text()).lower()
+                if 'failed' in t or 'error' in t:
+                    await page.screenshot(path='/content/dm_failed.png', full_page=True)
+                    raise RuntimeError(f'DM отклонил файл: {t}')
+                if 'uploading' in t or 'processing' in t: uploading = True; break
+            if uploading: await asyncio.sleep(5); waited += 5
+            else: break
+
+        await asyncio.sleep(5)
+        save_btn = page.locator("button:has-text('Save')").first
+        if await save_btn.is_enabled():
+            await save_btn.click(force=True); print(f'  ✅ ОПУБЛИКОВАНО: {title}')
+        else: raise RuntimeError('Кнопка Save заблокирована.')
+        await asyncio.sleep(5); await browser.close()
+
+def _dm_install_deps_once():
+    marker = WORKING / '.playwright_installed'
+    if marker.exists(): return
+    print('=== Установка Playwright & Chromium ===')
     subprocess.run(['pip', 'install', '-q', 'playwright', 'nest_asyncio'], check=True)
     subprocess.run(['playwright', 'install', 'chromium'], check=True)
+    subprocess.run(['playwright', 'install-deps'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    marker.touch()
+
+def _run_async(coro):
     import nest_asyncio
     nest_asyncio.apply()
-    print("Dailymotion upload process started.")
-    return {'dm_ok': 1, 'dm_fail': []}
+    return asyncio.get_event_loop().run_until_complete(coro)
+
+def upload_dm(*, lang: Optional[str] = None, files: Optional[List[str]] = None, title: Optional[str] = None, description: Optional[str] = None, category: Optional[str] = None, visibility: Optional[str] = None, kids: Optional[bool] = None, cookies_path: Optional[str] = None) -> dict:
+    _dm_install_deps_once()
+    p = {**DM_DEFAULTS}
+    if cookies_path: p['cookies_path'] = cookies_path
+    if category: p['category'] = category
+    if description: p['description'] = description
+    if visibility: p['visibility'] = visibility
+    if kids is not None: p['kids'] = kids
+
+    flist = [Path(x) if Path(x).is_absolute() else OUT_DIR / x for x in files] if files else (list_outputs(lang) if lang else list_outputs())
+    flist = [f for f in flist if f.exists()]
+    if not flist: print('Нет файлов для загрузки на DM.'); return {'dm_ok': 0, 'dm_fail': []}
+
+    tg_send(f'📺 DM: старт загрузки {len(flist)} файлов', silent=True)
+    res = {'dm_ok': 0, 'dm_fail': []}
+    for f in flist:
+        actual = _trim_video_if_needed(str(f))
+        gen_title = title or _dm_make_title(Path(actual).with_suffix('').name.replace('_trimmed', ''))
+        try:
+            _run_async(_dm_upload_one_async(actual, gen_title, p['description'], p['category'], p['cookies_path'], p['visibility'], p['kids']))
+            res['dm_ok'] += 1
+        except Exception as e:
+            print(f'❌ DM FAIL для {f.name}: {e}')
+            res['dm_fail'].append((f.name, str(e)))
+    return res
