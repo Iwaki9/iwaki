@@ -230,8 +230,10 @@ def render_one(video: Path, subtitle: Path, lang: str, output_base: Optional[str
             logo_w = get_even_int(video_w * float(profile["LogoWidthPct"]))
             logo_h = get_even_int((logo_h0 / logo_w0) * logo_w)
             pos_x, pos_y = get_overlay_position(video_w, video_h, logo_w, logo_h, profile)
+            
+            # ИСПРАВЛЕНИЕ: Добавлен мост ,hwdownload,format=nv12 после завершения работы overlay_cuda
             if Ctx.encoder == "nvenc" and os.environ.get("USE_GPU_OVERLAY", "0") == "1":
-                filter_complex = f"[1:v]format=rgba,colorchannelmixer=aa={profile['Alpha']},scale={logo_w}:{logo_h},format=nv12,hwupload_cuda[wm];[0:v]subtitles='{escaped_sub}':force_style='{style}',format=nv12,hwupload_cuda[v0];[v0][wm]overlay_cuda=x={pos_x}:y={pos_y}[v]"
+                filter_complex = f"[1:v]format=rgba,colorchannelmixer=aa={profile['Alpha']},scale={logo_w}:{logo_h},format=nv12,hwupload_cuda[wm];[0:v]subtitles='{escaped_sub}':force_style='{style}',format=nv12,hwupload_cuda[v0];[v0][wm]overlay_cuda=x={pos_x}:y={pos_y},hwdownload,format=nv12[v]"
             else:
                 filter_complex = f"[1:v]format=rgba,colorchannelmixer=aa={profile['Alpha']},scale={logo_w}:{logo_h}[wm];[0:v]subtitles='{escaped_sub}':force_style='{style}'[v0];[v0][wm]overlay={pos_x}:{pos_y}:eval=init[v]"
         except Exception: logo = None
