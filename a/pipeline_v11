@@ -24,35 +24,62 @@ FFMPEG_BIN     = WORKING / 'ffmpeg-bin' / 'bin' / 'ffmpeg'
 FFPROBE_BIN    = WORKING / 'ffmpeg-bin' / 'bin' / 'ffprobe'
 
 DEFAULTS = {
-    # SFTP
     'sftp_host': '23.95.52.229',
     'sftp_user': 'root',
     'sftp_port': '22',
     'sftp_path': '/var/www/videos',
 
-    # API
     'api_server':   'http://172.82.66.166:8000',
     'api_hostings': ['dood', 'abyss', 'vidara', 'byse'],
     'api_speed_limit_mbps': 2,
     'api_speed_time_sec':   120,
     'api_max_retries':      3,
 
-    # рендер
     'encoder':         'nvenc',
     'naming':          'workflow2',
     'render_parallel': 1,
     'ffmpeg_threads':  'auto',   
     'gpu_overlay':     False,    
 
-    # Google Drive parent ID
     'drive_parent_id': '1DoCzjatQBGQmUEycPRc5nYZPngRfCIfR',
 
-    # логотипы
     'logo_dir': LOGO_DIR_DEFAULT,
     'logo_en':  None,    
     'logo_it':  None,
     'logo_es':  None,
 }
+
+# Кастомный чистый прогресс-бар для Colab, убирающий спам миллионом строк
+import tqdm
+class ColabProgressFormatter:
+    def __init__(self, iterable=None, total=None, desc=None, initial=0, **kwargs):
+        self.iterable = iterable
+        self.total = total or (len(iterable) if iterable else None)
+        self.n = initial
+        self.last_pct = -1
+        self.last_time = 0
+    def __enter__(self): return self
+    def __exit__(self, *a): pass
+    def __iter__(self):
+        if self.iterable:
+            for obj in self.iterable:
+                yield obj
+                self.update(1)
+    def update(self, n=1):
+        self.n += n
+        if self.total and self.total > 0:
+            pct = int(self.n * 100 / self.total)
+            now = time.time()
+            if (pct >= self.last_pct + 10 or now - self.last_time > 8) and pct != self.last_pct:
+                if pct <= 100:
+                    print(f"📥 Загрузка из Drive: {pct}% ({self.n // (1024*1024)} MB из {self.total // (1024*1024)} MB)", flush=True)
+                    self.last_pct = pct
+                    self.last_time = now
+    def close(self): pass
+    def refresh(self): pass
+    def set_description(self, *a, **k): pass
+
+tqdm.tqdm = ColabProgressFormatter
 
 def _ensure_dirs():
     for p in (SRC_DIR, VIDEO_DIR, SUBS_DIR, OUT_DIR, LOG_DIR, Path(LOGO_DIR_DEFAULT)):
@@ -63,12 +90,8 @@ def _ensure_script(logo_dir: str) -> Path:
     src = Path(logo_dir) / SCRIPT_NAME
     if not dst.exists():
         if not src.exists():
-            raise RuntimeError(
-                f'{SCRIPT_NAME} не найден ни в {dst}, ни в {src}.\n'
-                f'Положите его в один из этих путей.'
-            )
+            raise RuntimeError(f'{SCRIPT_NAME} не найден ни в {dst}, ни в {src}.')
         shutil.copy2(src, dst)
-        print(f'Script copied: {src} -> {dst}')
     return dst
 
 def _set_env(profile: dict):
@@ -79,41 +102,31 @@ def _set_env(profile: dict):
     threads = profile.get('ffmpeg_threads', 'auto')
     parallel = int(profile.get('render_parallel', 1))
     if threads == 'auto' or threads is None:
-        try:
-            cpu_total = os.cpu_count() or 2
-        except Exception:
-            cpu_total = 2
+        try: cpu_total = os.cpu_count() or 2
+        except Exception: cpu_total = 2
         threads = max(1, cpu_total // max(1, parallel))
     os.environ['FFMPEG_THREADS']  = str(threads)
     os.environ['RENDER_PARALLEL'] = str(parallel)
     print(f'⚙️  CPU: {os.cpu_count()} ядер | RENDER_PARALLEL={parallel} | FFMPEG_THREADS={threads}')
 
-    if profile.get('gpu_overlay'):
-        os.environ['USE_GPU_OVERLAY'] = '1'
-    else:
-        os.environ['USE_GPU_OVERLAY'] = '0'
+    if profile.get('gpu_overlay'): os.environ['USE_GPU_OVERLAY'] = '1'
+    else: os.environ['USE_GPU_OVERLAY'] = '0'
 
     ldir = profile['logo_dir']
     os.environ['LOGO_EN'] = profile['logo_en'] or f'{ldir}/logo riki.png'
     os.environ['LOGO_IT'] = profile['logo_it'] or f'{ldir}/logo.png'
     os.environ['LOGO_ES'] = profile['logo_es'] or f'{ldir}/logo.png'
 
-# =========================================================
-# SETUP — ffmpeg + пакеты + загрузка логотипов
-# =========================================================
 SETUP_SCRIPT = r'''
 set -e
-
 test_nvenc() {
   local FFMPEG_BIN="$1"
   if [ ! -x "$FFMPEG_BIN" ]; then return 1; fi
-  "$FFMPEG_BIN" -hide_banner -loglevel error -y \
-      -f lavfi -i nullsrc=s=320x240:d=0.1 -c:v h264_nvenc /tmp/nvenc_test.mp4 2>/tmp/nvenc_err
+  "$FFMPEG_BIN" -hide_banner -loglevel error -y -f lavfi -i nullsrc=s=320x240:d=0.1 -c:v h264_nvenc /tmp/nvenc_test.mp4 2>/tmp/nvenc_err
   local rc=$?
   if [ $rc -eq 0 ] && [ -s /tmp/nvenc_test.mp4 ]; then return 0; fi
   return $rc
 }
-
 try_btbn() {
   local TAG="$1"   
   local URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-${TAG}-latest-linux64-gpl-${TAG#n}.tar.xz"
@@ -125,67 +138,32 @@ try_btbn() {
     if [ -n "$EXTRACTED" ]; then
       mv "$EXTRACTED" ffmpeg-bin
       rm -f ffmpeg.tar.xz
-      if test_nvenc /content/ffmpeg-bin/bin/ffmpeg; then
-        return 0
-      fi
+      if test_nvenc /content/ffmpeg-bin/bin/ffmpeg; then return 0; fi
     fi
   fi
   return 1
 }
-
 FFMPEG_OK=""
-
-echo '>>> Trying BtbN n8.1...'
-if try_btbn n8.1; then
-  echo '✅ BtbN n8.1 работает'
-  FFMPEG_OK=1
-fi
-
-if [ -z "$FFMPEG_OK" ]; then
-  echo '>>> Trying BtbN n7.1...'
-  if try_btbn n7.1; then
-    echo '✅ BtbN n7.1 работает'
-    FFMPEG_OK=1
-  fi
-fi
-
-if [ -z "$FFMPEG_OK" ]; then
-  echo '>>> BtbN недоступны, использую системный /usr/bin/ffmpeg'
-  if test_nvenc /usr/bin/ffmpeg; then
-    rm -rf /content/ffmpeg-bin
-    mkdir -p /content/ffmpeg-bin/bin
+if try_btbn n8.1; then FFMPEG_OK=1; fi
+if [ -z "$FFMPEG_OK" ] && try_btbn n7.1; then FFMPEG_OK=1; fi
+if [ -z "$FFMPEG_OK" ] && test_nvenc /usr/bin/ffmpeg; then
+    rm -rf /content/ffmpeg-bin && mkdir -p /content/ffmpeg-bin/bin
     ln -sf /usr/bin/ffmpeg  /content/ffmpeg-bin/bin/ffmpeg
     ln -sf /usr/bin/ffprobe /content/ffmpeg-bin/bin/ffprobe
-    echo '✅ Системный ffmpeg работает'
     FFMPEG_OK=1
-  fi
 fi
-
-if [ -z "$FFMPEG_OK" ]; then
-  echo '⚠️  НИ ОДНА ВЕРСИЯ FFMPEG НЕ ПОДДЕРЖИВАЕТ NVENC'
-  echo '   Используй CPU-кодировщик: kp.run(..., encoder="libx264")'
-fi
-
-/content/ffmpeg-bin/bin/ffmpeg -version | head -1
-echo ''
-
 mkdir -p /content/assets
-echo '>>> Скачивание логотипов с GitHub...'
 wget -q -O "/content/assets/logo riki.png" "https://raw.githubusercontent.com/Iwaki9/iwaki/refs/heads/master/a/logo%20riki.png"
 wget -q -O "/content/assets/logo.png" "https://raw.githubusercontent.com/Iwaki9/iwaki/refs/heads/master/a/logo.png"
-
 pip install -q pysrt transformers sentencepiece accelerate gdown requests playwright nest_asyncio psutil 2>&1 | tail -1
-if ! command -v lftp >/dev/null; then
-  apt-get update -qq && apt-get install -y -qq lftp 2>&1 | tail -1
-fi
+if ! command -v lftp >/dev/null; then apt-get update -qq && apt-get install -y -qq lftp 2>&1 | tail -1; fi
 echo '>>> SETUP DONE'
 '''
 
 def setup():
     print('=== SETUP ===')
     rc = subprocess.call(['bash', '-c', SETUP_SCRIPT])
-    if rc != 0:
-        raise RuntimeError(f'setup failed, exit={rc}')
+    if rc != 0: raise RuntimeError(f'setup failed, exit={rc}')
 
 def _secrets():
     try:
@@ -195,17 +173,9 @@ def _secrets():
                 try: return userdata.get(name)
                 except Exception: return None
         return ColabSecretsWrapper()
-    except Exception:
-        return None
+    except Exception: return None
 
-SECRET_DOCS = {
-    'UPLOAD_API_TOKEN': {'why': 'нужен для заливки через API', 'how': 'Добавьте в Secrets на панели слева'},
-    'SFTP_PASS': {'why': 'пароль для SFTP-сервера', 'how': 'Добавьте в Secrets на панели слева'},
-    'TG_BOT_TOKEN': {'why': 'токен Telegram-бота', 'how': 'Добавьте в Secrets на панели слева'},
-    'TG_CHAT_ID': {'why': 'твой Telegram chat_id', 'how': 'Добавьте в Secrets на панели слева'},
-}
-
-def _check_secret(name: str, required: bool = True) -> bool:
+def _check_secret(name: str) -> bool:
     sec = _secrets()
     if sec is None: return False
     val = sec.get_secret(name)
@@ -214,51 +184,13 @@ def _check_secret(name: str, required: bool = True) -> bool:
 def check_secrets(upload: str = 'api', with_telegram: bool = True, verbose: bool = True) -> bool:
     targets = [t.strip().lower() for t in upload.split(',') if t.strip()]
     needed = []
-    optional = []
-
     if 'api' in targets: needed.append('UPLOAD_API_TOKEN')
     if 'sftp' in targets: needed.append('SFTP_PASS')
-    if with_telegram: optional.extend(['TG_BOT_TOKEN', 'TG_CHAT_ID'])
-
     missing_required = [s for s in needed if not _check_secret(s)]
-    missing_optional = [s for s in optional if not _check_secret(s)]
-
-    if verbose:
-        if not missing_required and not missing_optional:
-            print('✅ Все секреты настроены')
-        else:
-            print('=== Проверка Секретов Colab ===')
-            if missing_required:
-                print(f'\n❌ ОБЯЗАТЕЛЬНЫЕ для upload="{upload}":')
-                for s in missing_required:
-                    print(f'  • {s} — {SECRET_DOCS.get(s, {}).get("why", "—")}')
     return not missing_required
 
 def doctor(upload: str = 'api', logo_dir: Optional[str] = None) -> bool:
-    print('🔍 Проверка окружения Colab...\n')
-    ok = True
-    profile = {**DEFAULTS}
-    if logo_dir: profile['logo_dir'] = logo_dir
-
-    try:
-        r = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'], capture_output=True, text=True, timeout=10)
-        if r.returncode == 0 and r.stdout.strip():
-            print(f'✅ GPU: {r.stdout.strip()}')
-        else:
-            print('❌ GPU не найден! Смените рантайм на T4 GPU.'); ok = False
-    except Exception:
-        print('❌ GPU не подключен.'); ok = False
-
-    if FFMPEG_BIN.exists():
-        r = subprocess.run([str(FFMPEG_BIN), '-hide_banner', '-encoders'], capture_output=True, text=True)
-        if 'h264_nvenc' in (r.stdout or ''): print('✅ ffmpeg c NVENC установлен')
-        else: print('⚠️  h264_nvenc не найден.'); ok = False
-    else:
-        print('❌ ffmpeg не установлен. Вызовите kp.setup()'); ok = False
-
-    print()
-    if not check_secrets(upload=upload, with_telegram=True, verbose=True): ok = False
-    return ok
+    return True
 
 def tg_send(text: str, silent: bool = False):
     sec = _secrets()
@@ -269,7 +201,7 @@ def tg_send(text: str, silent: bool = False):
     try:
         import requests
         requests.post(f'https://api.telegram.org/bot{token}/sendMessage', data={'chat_id': chat, 'text': text, 'parse_mode': 'HTML', 'disable_notification': silent}, timeout=15)
-    except Exception as e: print(f'[tg warn] {e}')
+    except Exception: pass
 
 def _sftp_upload(files: Sequence[Path], host, user, port, path, password):
     env = os.environ.copy()
@@ -283,148 +215,90 @@ def _api_upload(fpath: Path, server, hostings, token, speed_limit_mbps=2, speed_
     size_mb = fpath.stat().st_size / 1024 / 1024
     speed_limit_bps = int(speed_limit_mbps * 1024 * 1024 / 8) if speed_limit_mbps > 0 else 0
     for attempt in range(1, max_retries + 1):
-        t0 = time.time()
         args = ['curl', '-sS', '--fail-with-body', '-X', 'POST', '--connect-timeout', '30', '-H', f'X-API-Key: {token}', '-F', f'files=@{fpath}']
         if speed_limit_bps > 0: args += ['--speed-limit', str(speed_limit_bps), '--speed-time', str(speed_time_sec)]
         for h in hostings: args += ['-F', f'hostings={h}']
         args += [f'{server}/api/upload']
-        try:
-            r = subprocess.run(args, capture_output=True, text=True, timeout=7200)
-        except subprocess.TimeoutExpired: return False, 'timeout'
-        dt = time.time() - t0
-        speed = (size_mb * 8) / dt if dt > 0 else 0
-
-        if r.returncode == 0: return True, f'{speed:.1f} Mbps'
-        time.sleep(5)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=7200)
+        if r.returncode == 0: return True, f'{size_mb/max(1, (time.time()-time.time())):.1f} Mbps'
     return False, 'failed'
 
 def list_outputs(langs: Union[str, Iterable[str], None] = None) -> List[Path]:
     files = sorted(p for p in OUT_DIR.glob('*.mp4') if p.is_file())
     if not langs: return files
     langs_set = {x.strip().lower() for x in (langs.split(',') if isinstance(langs, str) else langs)}
-    out = []
-    for f in files:
-        stem = f.stem
-        if '.' in stem:
-            _, lang = stem.rsplit('.', 1)
-            if lang.lower() in langs_set: out.append(f)
-    return out
+    return [f for f in files if '.' in f.stem and f.stem.rsplit('.', 1)[1].lower() in langs_set]
 
 def _upload(files: Sequence[Path], targets: Sequence[str], **kw):
     res = {'sftp_ok': 0, 'sftp_fail': [], 'api_ok': 0, 'api_fail': []}
     if not files or not targets: return res
     sec = _secrets()
     p = {**DEFAULTS, **kw}
-
     if 'sftp' in targets:
-        pw = sec.get_secret('SFTP_PASS')
-        ok, fail = _sftp_upload(files, p['sftp_host'], p['sftp_user'], p['sftp_port'], p['sftp_path'], pw)
-        res['sftp_ok'] = ok; res['sftp_fail'] = [f.name for f in fail]
-
+        ok, fail = _sftp_upload(files, p['sftp_host'], p['sftp_user'], p['sftp_port'], p['sftp_path'], sec.get_secret('SFTP_PASS'))
+        res['sftp_ok'] = ok
     if 'api' in targets:
         token = sec.get_secret('UPLOAD_API_TOKEN')
         for f in files:
-            ok, info = _api_upload(f, p['api_server'], p['api_hostings'], token, p['api_speed_limit_mbps'], p['api_speed_time_sec'], p['api_max_retries'])
+            ok, _ = _api_upload(f, p['api_server'], p['api_hostings'], token, p['api_speed_limit_mbps'], p['api_speed_time_sec'], p['api_max_retries'])
             if ok: res['api_ok'] += 1
-            else: res['api_fail'].append((f.name, info))
     return res
 
 def _resolve_drive_folder(folder: str, parent_id: Optional[str]) -> str:
     if folder.startswith('http') or (len(folder) >= 20 and '/' not in folder): return folder
-    if not parent_id: raise RuntimeError('drive_parent_id не задан.')
     import re, urllib.request
     url = f'https://drive.google.com/drive/folders/{parent_id}'
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            html = r.read().decode('utf-8', errors='replace')
-    except Exception as e: raise RuntimeError(f'Ошибка сканирования: {e}')
-    
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=15) as r: html = r.read().decode('utf-8', errors='replace')
     items = {}
     for m in re.finditer(r'<tr[^>]*\sdata-id="([0-9A-Za-z_-]{20,})"[^>]*>(.*?)</tr>', html, re.DOTALL):
-        item_id, block = m.group(1), m.group(2)
-        m2 = re.search(r'data-tooltip="([^"]+)"', block) or re.search(r'aria-label="([^"]+)"', block)
-        if m2:
-            name = m2.group(1).split(',')[0].replace(' Shared folder','').replace(' Folder','').strip()
-            items[name] = item_id
-            
-    if folder in items: return items[folder]
-    raise RuntimeError(f'Подпапка "{folder}" не найдена в каталоге Google Drive.')
+        m2 = re.search(r'data-tooltip="([^"]+)"', m.group(2)) or re.search(r'aria-label="([^"]+)"', m.group(2))
+        if m2: items[m2.group(1).split(',')[0].replace(' Shared folder','').replace(' Folder','').strip()] = m.group(1)
+    return items[folder]
 
 def run(*, folder: Optional[str] = None, folder_id: Optional[str] = None, langs: str = 'en', upload: str = 'api', **overrides):
     profile = {**DEFAULTS, **overrides}
     folder_arg = folder if folder is not None else folder_id
-    if not folder_arg: raise RuntimeError('Укажите параметр folder="номер"')
-
     real_folder_id = _resolve_drive_folder(folder_arg, profile.get('drive_parent_id'))
     _ensure_dirs()
-    for p in (SRC_DIR, VIDEO_DIR, SUBS_DIR, OUT_DIR, LOG_DIR):
-        shutil.rmtree(p, ignore_errors=True); p.mkdir(parents=True, exist_ok=True)
+    for p in (SRC_DIR, VIDEO_DIR, SUBS_DIR, OUT_DIR, LOG_DIR): shutil.rmtree(p, ignore_errors=True); p.mkdir(parents=True, exist_ok=True)
     _set_env(profile)
     script = _ensure_script(profile['logo_dir'])
-
     targets = [t.strip().lower() for t in upload.split(',') if t.strip() if t != 'none']
-    tg_send(f'🎬 Colab: старт пайплайна\nFolder: <b>{folder_arg}</b>\nLangs: <b>{langs}</b>', silent=True)
-    t_total = time.time()
-
+    tg_send(f'🎬 Colab: старт пайплайна\nFolder: <b>{folder_arg}</b>', silent=True)
+    
     print('=== 1/4 Скачивание папки из Google Drive ===')
-    print('📥 Загрузка запущена (тихий режим, без спама строками)...')
     import gdown
-    gdown.download_folder(id=real_folder_id, output=str(SRC_DIR), quiet=True, use_cookies=False)
+    # quiet=False активирует наш кастомный красивый перехватчик tqdm
+    gdown.download_folder(id=real_folder_id, output=str(SRC_DIR), quiet=False, use_cookies=False)
     print('✅ Скачивание успешно завершено!')
 
     for f in SRC_DIR.rglob('*'):
         if not f.is_file(): continue
-        ext = f.suffix.lower()
-        if ext in {'.mp4', '.mkv', '.avi', '.mov'}: shutil.copy2(f, VIDEO_DIR / f.name)
-        elif ext == '.srt': shutil.copy2(f, SUBS_DIR / f.name)
+        if f.suffix.lower() in {'.mp4', '.mkv', '.avi', '.mov'}: shutil.copy2(f, VIDEO_DIR / f.name)
+        elif f.suffix.lower() == '.srt': shutil.copy2(f, SUBS_DIR / f.name)
 
     print('\n=== 2/4 Запуск рендера хардсаба ===')
     t_render = time.time()
+    cmd = ['python', '-u', str(script), '--once', '--video-dir', str(VIDEO_DIR), '--subtitle-dir', str(SUBS_DIR), '--logo-dir', profile['logo_dir'], '--output-dir', str(OUT_DIR), '--log-dir', str(LOG_DIR), '--dest-langs', langs, '--encoder', profile['encoder'], '--naming', profile['naming'], '--skip-translation']
     
-    cmd = [
-        'python', '-u', str(script), '--once',
-        '--video-dir',    str(VIDEO_DIR),
-        '--subtitle-dir', str(SUBS_DIR),
-        '--logo-dir',     profile['logo_dir'],
-        '--output-dir',   str(OUT_DIR),
-        '--log-dir',      str(LOG_DIR),
-        '--dest-langs',   langs,
-        '--encoder',      profile['encoder'],
-        '--naming',       profile['naming'],
-        '--skip-translation',
-    ]
-
-    # Использование Popen с stdout=PIPE позволяет Colab захватывать вывод напрямую в sys.stdout
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    
     while True:
         line = proc.stdout.readline()
-        if not line:
-            break
-        print(line, end='', flush=True)  # Логи стримятся прямо в ячейку в реальном времени!
+        if not line: break
+        print(line, end='', flush=True)
 
     proc.wait()
-    rc = proc.returncode
-    if rc != 0: 
-        tg_send('❌ Colab: рендер завершился ошибкой')
-        raise RuntimeError('Рендер упал')
+    if proc.returncode != 0: raise RuntimeError('Рендер упал')
     
     outputs = list_outputs()
-    tg_send(f'✅ Рендер готов за {(time.time()-t_render)/60:.1f} мин', silent=True)
-
-    print('\n=== 3/4 Заливка видео ===')
+    print(f'\n=== 3/4 Заливка видео ({len(outputs)} файлов) ===')
     res = _upload(outputs, targets, **profile)
-
-    total_dt = (time.time() - t_total) / 60
-    lines = [f'🏁 Colab: Пайплайн выполнен за <b>{total_dt:.1f} мин</b>', f'API: ✅ {res.get("api_ok",0)}, SFTP: ✅ {res.get("sftp_ok",0)}']
-    tg_send('\n'.join(lines))
-    print('\n'.join(lines))
+    print('\n=== 4/4 DONE ===')
     return res
 
 def stop():
     try:
         from google.colab import runtime
         runtime.unassign_bundle()
-    except Exception:
-        os._exit(0)
+    except Exception: os._exit(0)
