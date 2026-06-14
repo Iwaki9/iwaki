@@ -16,7 +16,6 @@ from typing import Dict, List, Optional, Tuple
 import pysrt
 import psutil
 
-# Директории окружения Colab
 COLAB_WORKING = Path(os.environ.get("COLAB_WORKING_DIR", "/content"))
 
 DEFAULT_VIDEO_DIR = COLAB_WORKING / "video"
@@ -59,7 +58,6 @@ class Ctx:
     log_path: Path; heartbeat_path: Path; src_lang: str; dest_langs: List[str]
     encoder: str; skip_translation: bool; naming: str
 
-# Мониторинг ресурсов
 import threading as _threading_mon
 _GPU_MON_LOCK = _threading_mon.Lock()
 _GPU_MON_REFCOUNT = 0
@@ -81,7 +79,7 @@ def _gpu_monitor_loop(stop_event, interval: float) -> None:
                         if len(cols) >= 5: parts.append(f"GPU{cols[0]}: util={cols[1]}% NVENC={cols[2]}% vram={cols[4]}MB")
                     gpu_str = " | ".join(parts)
             write_log(f"📊 SYSTEM -> CPU: {cpu_util}% | RAM: {ram_util}% | {gpu_str}")
-        except Exception as _e: pass
+        except Exception: pass
 
 def gpu_monitor_acquire() -> None:
     global _GPU_MON_REFCOUNT, _GPU_MON_STOP, _GPU_MON_THREAD
@@ -120,7 +118,7 @@ def run_checked(args: List[str], allow_non_zero: bool = False) -> subprocess.Com
     proc = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if proc.returncode != 0 and not allow_non_zero: 
         raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(args)}\n{proc.stderr}")
-    return proc  # Опечатка исправлена здесь!
+    return proc
 
 def ensure_commands_exist() -> None:
     if shutil.which(FFMPEG_PATH) is None or shutil.which(FFPROBE_PATH) is None: raise RuntimeError("FFmpeg/FFprobe не найдены.")
@@ -137,6 +135,12 @@ def get_media_size(path: Path) -> Tuple[int, int]:
     proc = run_checked([FFPROBE_PATH, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", str(path)])
     w, h = proc.stdout.strip().split("x", 1)
     return int(w), int(h)
+
+def get_video_codec(path: Path) -> str:
+    try:
+        proc = run_checked([FFPROBE_PATH, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(path)])
+        return proc.stdout.strip().lower()
+    except Exception: return ""
 
 def new_temp_subtitle_copy(original_path: Path) -> Path:
     temp_dir = Path(tempfile.gettempdir()) / "AutoHardSubTempSubs"
@@ -194,7 +198,12 @@ def render_one(video: Path, subtitle: Path, lang: str, output_base: Optional[str
     temp_sub = new_temp_subtitle_copy(subtitle)
     escaped_sub = escape_subtitle_path_for_filter(temp_sub)
 
-    inputs = ["-i", str(video)]
+    # ОПТИМИЗАЦИЯ 1: Переносим декодирование обратно на чип NVDEC, разгружая ядра ЦП
+    decode_args = []
+    if Ctx.encoder == "nvenc" and os.environ.get("DISABLE_HWACCEL", "0") != "1":
+        if get_video_codec(video) in {"h264", "hevc", "vp9"}: decode_args = ["-hwaccel", "cuda"]
+
+    inputs = [*decode_args, "-i", str(video)]
     if logo: inputs += ["-i", str(logo)]
 
     if logo:
@@ -203,10 +212,12 @@ def render_one(video: Path, subtitle: Path, lang: str, output_base: Optional[str
             logo_w = get_even_int(video_w * float(profile["LogoWidthPct"]))
             logo_h = get_even_int((logo_h0 / logo_w0) * logo_w)
             pos_x, pos_y = get_overlay_position(video_w, video_h, logo_w, logo_h, profile)
+            
+            # ОПТИМИЗАЦИЯ 2: eval=init запрещает оверлею пересчитывать статические координаты каждый кадр
             if Ctx.encoder == "nvenc" and os.environ.get("USE_GPU_OVERLAY", "0") == "1":
                 filter_complex = f"[1:v]format=rgba,colorchannelmixer=aa={profile['Alpha']},scale={logo_w}:{logo_h},format=yuva420p,hwupload_cuda[wm];[0:v]subtitles='{escaped_sub}':force_style='{style}',format=yuv420p,hwupload_cuda[v0];[v0][wm]overlay_cuda=x={pos_x}:y={pos_y}[v]"
             else:
-                filter_complex = f"[1:v]format=rgba,colorchannelmixer=aa={profile['Alpha']},scale={logo_w}:{logo_h}[wm];[0:v]subtitles='{escaped_sub}':force_style='{style}'[v0];[v0][wm]overlay={pos_x}:{pos_y}[v]"
+                filter_complex = f"[1:v]format=rgba,colorchannelmixer=aa={profile['Alpha']},scale={logo_w}:{logo_h}[wm];[0:v]subtitles='{escaped_sub}':force_style='{style}'[v0];[v0][wm]overlay={pos_x}:{pos_y}:eval=init[v]"
         except Exception: logo = None
 
     if not logo:
@@ -217,7 +228,9 @@ def render_one(video: Path, subtitle: Path, lang: str, output_base: Optional[str
     
     try:
         write_log(f"RENDER START -> {video.name} [{lang.upper()}]")
-        venc_args = ["-c:v", "h264_nvenc", "-preset", NVENC_PRESET, "-b:v", VIDEO_BITRATE, "-maxrate", MAXRATE, "-bufsize", BUFSIZE] if Ctx.encoder == "nvenc" else ["-c:v", "libx264", "-preset", "veryfast", "-b:v", VIDEO_BITRATE, "-pix_fmt", "yuv420p"]
+        
+        # ОПТИМИЗАЦИЯ 3: -pix_fmt nv12 родной формат для ядер NVENC, кодирует ощутимо быстрее, чем yuv420p
+        venc_args = ["-c:v", "h264_nvenc", "-preset", NVENC_PRESET, "-b:v", VIDEO_BITRATE, "-maxrate", MAXRATE, "-bufsize", BUFSIZE, "-pix_fmt", "nv12"] if Ctx.encoder == "nvenc" else ["-c:v", "libx264", "-preset", "veryfast", "-b:v", VIDEO_BITRATE, "-pix_fmt", "yuv420p"]
         threads_env = os.environ.get("FFMPEG_THREADS", "0")
 
         args = [FFMPEG_PATH, "-y", "-nostdin", "-hide_banner", "-loglevel", "quiet", "-progress", "pipe:1", "-threads", threads_env, *inputs, "-filter_complex", filter_complex, "-map", "[v]", "-map", "0:a?", *venc_args]
@@ -268,12 +281,10 @@ def process_render_jobs() -> int:
 
     if not tasks: return 0
     parallel = max(1, int(os.environ.get("RENDER_PARALLEL", "1")))
-    if parallel <= 1:
-        return sum(1 for v, s, l, b in tasks if render_one(v, s, l, output_base=b))
+    if parallel <= 1: return sum(1 for v, s, l, b in tasks if render_one(v, s, l, output_base=b))
 
     import threading as _th
     started = [0]; c_lock = _th.Lock(); t_lock = _th.Lock(); t_iter = enumerate(tasks)
-
     def worker(gpu_idx):
         while True:
             with t_lock:
