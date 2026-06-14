@@ -91,21 +91,40 @@ def _resolve_drive_folder(folder: str, parent_id: Optional[str]) -> str:
         raise RuntimeError(f"Не удалось загрузить страницу Drive: {e}")
 
     items = {}
+
+    # Ищем все data-id
     for m in re.finditer(r'data-id="([0-9A-Za-z_-]{20,})"', html):
         item_id = m.group(1)
-        # Простой поиск имени рядом
-        start = max(0, m.start() - 300)
-        end = min(len(html), m.end() + 300)
+        start = max(0, m.start() - 400)
+        end = min(len(html), m.end() + 400)
         block = html[start:end]
-        name_match = re.search(r'aria-label="([^"]+)"', block) or re.search(r'data-tooltip="([^"]+)"', block)
-        if name_match:
-            name = name_match.group(1).split(',')[0].strip()
-            items[name] = item_id
 
+        # Пробуем найти имя
+        name_match = (
+            re.search(r'aria-label="([^"]+)"', block) or
+            re.search(r'data-tooltip="([^"]+)"', block)
+        )
+        if name_match:
+            raw_name = name_match.group(1)
+            # Чистим суффиксы Google Drive
+            clean_name = raw_name.split(',')[0].strip()
+            for suffix in [' Shared folder', ' Shared Folder', ' Folder', ' folder']:
+                if clean_name.endswith(suffix):
+                    clean_name = clean_name[:-len(suffix)].strip()
+                    break
+            items[clean_name] = item_id
+
+    # Проверяем точное совпадение
     if folder in items:
         sub_id = items[folder]
         print(f"✅ Найдена подпапка '{folder}': {sub_id}")
         return sub_id
+
+    # Пробуем нечёткий поиск (на случай "1 Shared folder")
+    for name, item_id in items.items():
+        if name.startswith(folder + " ") or name == folder:
+            print(f"✅ Найдена подпапка '{name}' → '{folder}': {item_id}")
+            return item_id
 
     raise RuntimeError(f"Подпапка '{folder}' не найдена. Доступные: {list(items.keys())[:10]}")
 
