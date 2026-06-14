@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Tuple
 import pysrt
 import psutil
 
+# Директории окружения Colab
 COLAB_WORKING = Path(os.environ.get("COLAB_WORKING_DIR", "/content"))
 
 DEFAULT_VIDEO_DIR = COLAB_WORKING / "video"
@@ -58,6 +59,7 @@ class Ctx:
     log_path: Path; heartbeat_path: Path; src_lang: str; dest_langs: List[str]
     encoder: str; skip_translation: bool; naming: str
 
+# Мониторинг ресурсов
 import threading as _threading_mon
 _GPU_MON_LOCK = _threading_mon.Lock()
 _GPU_MON_REFCOUNT = 0
@@ -116,8 +118,9 @@ def get_even_int(value: float) -> int:
 
 def run_checked(args: List[str], allow_non_zero: bool = False) -> subprocess.CompletedProcess:
     proc = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if proc.returncode != 0 and not allow_non_zero: raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(args)}\n{proc.stderr}")
-    return run_checked
+    if proc.returncode != 0 and not allow_non_zero: 
+        raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(args)}\n{proc.stderr}")
+    return proc  # Опечатка исправлена здесь!
 
 def ensure_commands_exist() -> None:
     if shutil.which(FFMPEG_PATH) is None or shutil.which(FFPROBE_PATH) is None: raise RuntimeError("FFmpeg/FFprobe не найдены.")
@@ -217,14 +220,12 @@ def render_one(video: Path, subtitle: Path, lang: str, output_base: Optional[str
         venc_args = ["-c:v", "h264_nvenc", "-preset", NVENC_PRESET, "-b:v", VIDEO_BITRATE, "-maxrate", MAXRATE, "-bufsize", BUFSIZE] if Ctx.encoder == "nvenc" else ["-c:v", "libx264", "-preset", "veryfast", "-b:v", VIDEO_BITRATE, "-pix_fmt", "yuv420p"]
         threads_env = os.environ.get("FFMPEG_THREADS", "0")
 
-        # Добавлен флаг -nostdin, предотвращающий падение в вечный lock ожидания ввода терминала
         args = [FFMPEG_PATH, "-y", "-nostdin", "-hide_banner", "-loglevel", "quiet", "-progress", "pipe:1", "-threads", threads_env, *inputs, "-filter_complex", filter_complex, "-map", "[v]", "-map", "0:a?", *venc_args]
         args += ["-c:a", "copy"] if USE_AUDIO_COPY else ["-c:a", "aac", "-b:a", "128k"]
         args.append(str(output_path))
 
         gpu_monitor_acquire()
         try: 
-            # Добавлены параметры stdin=subprocess.DEVNULL и bufsize=1 (построчный сброс кэша)
             proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, bufsize=1, text=True, encoding="utf-8", env=ffmpeg_env)
             frame, fps, speed = "0", "0", "0x"
             last_print_time = 0
