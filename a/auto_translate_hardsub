@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import pysrt
 
-# Переменная окружения для Colab
+# Директории окружения Colab
 COLAB_WORKING = Path(os.environ.get("COLAB_WORKING_DIR", "/content"))
 
 DEFAULT_VIDEO_DIR = COLAB_WORKING / "video"
@@ -30,6 +30,8 @@ FFPROBE_PATH = os.environ.get("FFPROBE_PATH", "ffprobe")
 NLLB_LANG_MAP = {
     "tr": "tur_Latn", "en": "eng_Latn", "it": "ita_Latn", "es": "spa_Latn",
     "ru": "rus_Cyrl", "fr": "fra_Latn", "de": "deu_Latn", "pt": "por_Latn",
+    "ar": "arb_Arab", "uk": "ukr_Cyrl", "az": "azj_Latn", "kk": "kaz_Cyrl",
+    "uz": "uzn_Latn", "zh": "zho_Hans", "ja": "jpn_Jpan", "ko": "kor_Hang",
 }
 
 DEFAULT_NLLB_MODEL = os.environ.get("NLLB_MODEL", "facebook/nllb-200-distilled-600M")
@@ -63,6 +65,7 @@ class Ctx:
     log_path: Path; heartbeat_path: Path; src_lang: str; dest_langs: List[str]
     encoder: str; skip_translation: bool; naming: str
 
+# Мониторинг ресурсов графического чипа
 import threading as _threading_mon
 _GPU_MON_LOCK = _threading_mon.Lock()
 _GPU_MON_REFCOUNT = 0
@@ -76,8 +79,7 @@ def _gpu_monitor_loop(stop_event, interval: float) -> None:
             if r.returncode == 0:
                 for line in r.stdout.strip().splitlines():
                     cols = [x.strip() for x in line.split(",")]
-                    if len(cols) >= 5:
-                        write_log(f"GPU{cols[0]}: util={cols[1]}% NVENC={cols[2]}% vram={cols[4]}MB")
+                    if len(cols) >= 5: write_log(f"GPU{cols[0]}: util={cols[1]}% NVENC={cols[2]}% vram={cols[4]}MB")
         except Exception as _e: write_log(f"GPU monitor warn: {_e}")
 
 def gpu_monitor_acquire() -> None:
@@ -188,9 +190,57 @@ def resolve_logo_path(lang: str) -> Optional[Path]:
     for ext in (".png", ".jpg", ".jpeg"):
         candidate = Ctx.logo_dir / f"{lang}{ext}"
         if candidate.exists(): return candidate
-    # Фаллбэк на универсальный logo.png, если языковой не найден
     generic = Ctx.logo_dir / "logo.png"
     return generic if generic.exists() else None
+
+# Локальный перевод NLLB-200
+_NLLB_PIPE = None
+def _get_nllb_pipeline():
+    global _NLLB_PIPE
+    if _NLLB_PIPE is not None: return _NLLB_PIPE
+    write_log(f"Загрузка локальной нейросети перевода {DEFAULT_NLLB_MODEL}...")
+    import torch
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+    device = 0 if torch.cuda.is_available() else -1
+    tokenizer = AutoTokenizer.from_pretrained(DEFAULT_NLLB_MODEL)
+    model = AutoModelForSeq2SeqLM.from_pretrained(DEFAULT_NLLB_MODEL, torch_dtype=torch.float16 if device == 0 else torch.float32)
+    if device == 0: model = model.to("cuda")
+    _NLLB_PIPE = {"tokenizer": tokenizer, "model": model, "device": device}
+    return _NLLB_PIPE
+
+def translate_batch_local(texts: List[str], src: str, dest: str) -> List[str]:
+    if not texts: return []
+    pipe = _get_nllb_pipeline()
+    tokenizer, model, device = pipe["tokenizer"], pipe["model"], pipe["device"]
+    src_code, dest_code = NLLB_LANG_MAP[src.lower()], NLLB_LANG_MAP[dest.lower()]
+    tokenizer.src_lang = src_code
+    import torch
+    results = []
+    for start in range(0, len(texts), TRANSLATE_BATCH_SIZE):
+        chunk = texts[start:start + TRANSLATE_BATCH_SIZE]
+        inputs = tokenizer(chunk, return_tensors="pt", padding=True, truncation=True, max_length=TRANSLATE_MAX_LENGTH)
+        if device == 0: inputs = {k: v.to("cuda") for k, v in inputs.items()}
+        forced_bos = tokenizer.convert_tokens_to_ids(dest_code)
+        with torch.no_grad():
+            out = model.generate(**inputs, forced_bos_token_id=forced_bos, max_length=TRANSLATE_MAX_LENGTH, num_beams=2)
+        results.extend(tokenizer.batch_decode(out, skip_special_tokens=True))
+    return results
+
+def get_state_dir(parent: Path) -> Path:
+    p = parent / STATE_DIR_NAME; p.mkdir(parents=True, exist_ok=True); return p
+
+def get_sidecar_path(target_file: Path, suffix: str) -> Path:
+    return get_state_dir(target_file.parent) / f"{target_file.name}{suffix}"
+
+def load_meta(output_file: Path) -> Optional[dict]:
+    p = get_sidecar_path(output_file, ".meta.json")
+    if p.exists():
+        try: return json.loads(p.read_text(encoding="utf-8"))
+        except Exception: return None
+    return None
+
+def save_meta(output_file: Path, meta: dict) -> None:
+    get_sidecar_path(output_file, ".meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def render_one(video: Path, subtitle: Path, lang: str, output_base: Optional[str] = None, gpu_index: Optional[int] = None) -> bool:
     profile = LANGUAGE_PROFILES.get(lang)
@@ -199,7 +249,7 @@ def render_one(video: Path, subtitle: Path, lang: str, output_base: Optional[str
     logo = resolve_logo_path(lang)
     base_name = output_base if output_base else video.stem
     output_path = Ctx.output_dir / f"{base_name}.{lang}.mp4"
-    done_path = Ctx.output_dir / STATE_DIR_NAME / f"{output_path.name}.done"
+    done_path = get_sidecar_path(output_path, ".done")
 
     if done_path.exists() or output_path.exists(): return False
 
@@ -241,15 +291,25 @@ def render_one(video: Path, subtitle: Path, lang: str, output_base: Optional[str
         args += ["-c:a", "copy"] if USE_AUDIO_COPY else ["-c:a", "aac", "-b:a", "128k"]
         args.append(str(output_path))
 
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".ffmpeg.log", encoding="utf-8") as tf: err_path = tf.name
         gpu_monitor_acquire()
-        try: proc = subprocess.run(args, stdout=subprocess.DEVNULL, env=ffmpeg_env)
+        try:
+            with open(err_path, "w", encoding="utf-8") as ef: proc = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=ef, env=ffmpeg_env)
         finally: gpu_monitor_release()
 
+        if proc.returncode != 0:
+            try:
+                with open(err_path, "r", encoding="utf-8") as ef: tail = ef.readlines()[-30:]
+                write_log("FFmpeg stderr tail:\n" + "".join(tail))
+            except Exception: pass
+        try: os.unlink(err_path)
+        except Exception: pass
+
         if proc.returncode == 0 or (output_path.exists() and output_path.stat().st_size > 1024 * 1024):
-            done_path.parent.mkdir(parents=True, exist_ok=True)
             done_path.write_text("done")
             write_log(f"RENDER DONE {output_path.name}")
             return True
+        if output_path.exists(): output_path.unlink()
         return False
     finally:
         temp_sub.unlink(missing_ok=True); update_heartbeat()
@@ -264,12 +324,10 @@ def process_render_jobs() -> int:
 
     if not tasks: return 0
     parallel = max(1, int(os.environ.get("RENDER_PARALLEL", "1")))
-    if parallel <= 1:
-        return sum(1 for v, s, l, b in tasks if render_one(v, s, l, output_base=b))
+    if parallel <= 1: return sum(1 for v, s, l, b in tasks if render_one(v, s, l, output_base=b))
 
     import threading as _th
     started = [0]; c_lock = _th.Lock(); t_lock = _th.Lock(); t_iter = enumerate(tasks)
-
     def worker(gpu_idx):
         while True:
             with t_lock:
@@ -295,6 +353,7 @@ def main() -> None:
     parser.add_argument("--dest-langs", default="en,it,es")
     parser.add_argument("--encoder", default="auto")
     parser.add_argument("--skip-translation", action="store_true")
+    parser.add_argument("--skip-render", action="store_true")
     parser.add_argument("--naming", default="stem")
     args = parser.parse_args()
 
@@ -309,7 +368,7 @@ def main() -> None:
     Ctx.encoder = detect_encoder(args.encoder)
 
     write_log("Colab Core Engine Started.")
-    process_render_jobs()
+    if not args.skip_render: process_render_jobs()
     write_log("Pipeline finished.")
 
 if __name__ == "__main__":
