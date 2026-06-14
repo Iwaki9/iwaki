@@ -4,7 +4,6 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 WORKING   = Path('/content')
 SRC_DIR   = WORKING / 'src'
@@ -14,18 +13,8 @@ OUT_DIR   = WORKING / 'output'
 LOG_DIR   = WORKING / 'logs'
 
 FFMPEG_BIN  = WORKING / 'ffmpeg-bin' / 'bin' / 'ffmpeg'
-FFPROBE_BIN = WORKING / 'ffmpeg-bin' / 'bin' / 'ffprobe'
 
 DEFAULTS = {
-    'sftp_host': '23.95.52.229',
-    'sftp_user': 'root',
-    'sftp_port': '22',
-    'sftp_path': '/var/www/videos',
-    'api_server': 'http://172.82.66.166:8000',
-    'api_hostings': ['dood', 'abyss', 'vidara', 'byse'],
-    'api_speed_limit_mbps': 2,
-    'api_speed_time_sec': 120,
-    'api_max_retries': 3,
     'encoder': 'nvenc',
     'naming': 'workflow2',
     'render_parallel': 2,
@@ -45,19 +34,7 @@ def ensure_dirs():
 def set_env(profile: dict):
     os.environ['PATH'] = f'{FFMPEG_BIN.parent}:' + os.environ.get('PATH', '')
     os.environ['FFMPEG_PATH'] = str(FFMPEG_BIN)
-    os.environ['FFPROBE_PATH'] = str(FFPROBE_BIN)
-    threads = profile.get('ffmpeg_threads', 'auto')
-    parallel = int(profile.get('render_parallel', 1))
-    if threads == 'auto' or threads is None:
-        cpu_total = os.cpu_count() or 4
-        threads = max(1, cpu_total // max(1, parallel))
-    os.environ['FFMPEG_THREADS'] = str(threads)
-    os.environ['RENDER_PARALLEL'] = str(parallel)
-    if profile.get('gpu_overlay'):
-        os.environ['USE_GPU_OVERLAY'] = '1'
-    os.environ['LOGO_EN'] = profile['logo_en']
-    os.environ['LOGO_IT'] = profile['logo_it']
-    os.environ['LOGO_ES'] = profile['logo_es']
+    os.environ['FFPROBE_PATH'] = str(FFMPEG_BIN).replace('ffmpeg', 'ffprobe')
 
 def download_logos():
     os.makedirs('/content/logos', exist_ok=True)
@@ -73,13 +50,25 @@ def setup():
     print("=== SETUP (Colab) ===")
     ensure_dirs()
     download_logos()
+
+    # === Улучшенная установка ffmpeg ===
     if not FFMPEG_BIN.exists():
-        subprocess.run(['bash', '-c', '''
-            rm -rf /content/ffmpeg-bin
-            wget -q https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-n8.1.tar.xz -O /tmp/ffmpeg.tar.xz
-            tar -xf /tmp/ffmpeg.tar.xz -C /content
-            mv /content/ffmpeg-n8.1* /content/ffmpeg-bin
-        '''], check=True)
+        print("Устанавливаем ffmpeg с NVENC (может занять 1-2 минуты)...")
+        try:
+            subprocess.run(['bash', '-c', '''
+                rm -rf /content/ffmpeg-bin /tmp/ffmpeg.tar.xz
+                wget -q --show-progress https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-n8.1.tar.xz -O /tmp/ffmpeg.tar.xz
+                tar -xf /tmp/ffmpeg.tar.xz -C /content
+                mv /content/ffmpeg-n8.1* /content/ffmpeg-bin 2>/dev/null || true
+            '''], check=True, timeout=300)
+            print("✅ ffmpeg с NVENC установлен")
+        except Exception as e:
+            print(f"⚠️ Не удалось установить BtbN ffmpeg: {e}")
+            print("Будет использован системный ffmpeg (/usr/bin/ffmpeg)")
+            os.makedirs('/content/ffmpeg-bin/bin', exist_ok=True)
+            subprocess.run(['ln', '-sf', '/usr/bin/ffmpeg', '/content/ffmpeg-bin/bin/ffmpeg'], check=False)
+            subprocess.run(['ln', '-sf', '/usr/bin/ffprobe', '/content/ffmpeg-bin/bin/ffprobe'], check=False)
+
     subprocess.run(['pip', 'install', '-q', 'gdown', 'pysrt', 'transformers', 'sentencepiece', 'accelerate'], check=True)
     print("✅ SETUP завершён")
 
@@ -87,17 +76,22 @@ def run(*, folder: str, langs: str = 'en', upload: str = 'api', **overrides):
     profile = {**DEFAULTS, **overrides}
     ensure_dirs()
     set_env(profile)
+
     for p in (SRC_DIR, VIDEO_DIR, SUBS_DIR, OUT_DIR, LOG_DIR):
         shutil.rmtree(p, ignore_errors=True)
         p.mkdir(parents=True, exist_ok=True)
+
     import gdown
+    print(f"=== Скачивание папки {folder} ===")
     gdown.download_folder(id=folder, output=str(SRC_DIR), quiet=False)
+
     for f in SRC_DIR.rglob('*'):
         if f.is_file():
             if f.suffix.lower() in {'.mp4', '.mkv'}:
                 shutil.copy2(f, VIDEO_DIR / f.name)
             elif f.suffix.lower() == '.srt':
                 shutil.copy2(f, SUBS_DIR / f.name)
+
     script = Path('/content/auto_translate_hardsub_colab.py')
     rc = subprocess.call([
         'python', str(script), '--once',
@@ -112,6 +106,7 @@ def run(*, folder: str, langs: str = 'en', upload: str = 'api', **overrides):
     ])
     if rc != 0:
         raise RuntimeError(f"Хардсаб завершился с ошибкой: {rc}")
+
     print(f"Готово файлов: {len(list(OUT_DIR.glob('*.mp4')))}")
 
 def stop():
