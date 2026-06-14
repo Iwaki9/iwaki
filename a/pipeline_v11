@@ -53,6 +53,7 @@ def setup():
     print("=== SETUP (Colab) ===")
     ensure_dirs()
     download_logos()
+
     if not FFMPEG_BIN.exists():
         print("Устанавливаем ffmpeg с NVENC...")
         try:
@@ -67,12 +68,16 @@ def setup():
             os.makedirs('/content/ffmpeg-bin/bin', exist_ok=True)
             subprocess.run(['ln', '-sf', '/usr/bin/ffmpeg', '/content/ffmpeg-bin/bin/ffmpeg'], check=False)
             subprocess.run(['ln', '-sf', '/usr/bin/ffprobe', '/content/ffmpeg-bin/bin/ffprobe'], check=False)
+
+    # === Важно: устанавливаем переменные окружения ===
+    set_env(DEFAULTS)
+    os.environ['PATH'] = f'{FFMPEG_BIN.parent}:' + os.environ.get('PATH', '')
+
     subprocess.run(['pip', 'install', '-q', 'gdown'], check=True)
     print("✅ SETUP завершён")
 
 
 def _resolve_drive_folder(folder: str, parent_id: Optional[str]) -> str:
-    """Ищет ID подпапки по имени (работает для публичных папок)."""
     if folder.startswith('http'):
         return folder
     if len(folder) >= 20 and '/' not in folder:
