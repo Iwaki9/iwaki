@@ -1,36 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AutoTranslate + HardSub — Kaggle-версия.
-
-Адаптация локального скрипта под облачную среду Kaggle:
-  • Все пути перенесены в /kaggle/working (с возможностью переопределить через env-переменные).
-  • Один проход (--once), без watcher-цикла, без BurntToast-уведомлений.
-  • Перевод субтитров локальной моделью NLLB-200 (HuggingFace Transformers) — без обращения к внешним API.
-  • Хардсаб через ffmpeg с h264_nvenc (на Kaggle GPU T4). При желании можно переключить на libx264.
-
-Структура входа (по умолчанию):
-    /kaggle/working/input/video/        <-- *.mp4/.mkv/.avi/.mov
-    /kaggle/working/input/subtitles/    <-- *.srt (исходник — БЕЗ языкового хвоста)
-    /kaggle/working/input/logos/en.png  <-- логотипы по языкам
-    /kaggle/working/input/logos/it.png
-    /kaggle/working/input/logos/es.png
-
-Структура выхода:
-    /kaggle/working/output/             <-- готовые *.lang.mp4
-    /kaggle/working/input/subtitles/    <-- сюда же кладутся переведённые *.lang.srt
-    /kaggle/working/logs/               <-- лог, heartbeat, мета-файлы
-
-Запуск из ноутбука:
-    !python /kaggle/working/auto_translate_hardsub_kaggle.py --once
-
-Или с переопределением параметров:
-    !python auto_translate_hardsub_kaggle.py --once \\
-        --video-dir /kaggle/input/my-videos \\
-        --subtitle-dir /kaggle/working/subs \\
-        --output-dir /kaggle/working/out \\
-        --encoder nvenc \\
-        --src-lang tr --dest-langs en,it,es
+AutoTranslate + HardSub — Colab версия (полная, адаптированная из Kaggle)
 """
 
 from __future__ import annotations
@@ -50,13 +21,13 @@ from typing import Dict, List, Optional, Tuple
 import pysrt
 
 # =========================================================
-# ДЕФОЛТНЫЕ ПУТИ (можно переопределить через CLI или env)
+# ДЕФОЛТНЫЕ ПУТИ (Colab)
 # =========================================================
-KAGGLE_WORKING = Path(os.environ.get("KAGGLE_WORKING_DIR", "/kaggle/working"))
+KAGGLE_WORKING = Path(os.environ.get("KAGGLE_WORKING_DIR", "/content"))
 
-DEFAULT_VIDEO_DIR = KAGGLE_WORKING / "input" / "video"
-DEFAULT_SUBTITLE_DIR = KAGGLE_WORKING / "input" / "subtitles"
-DEFAULT_LOGO_DIR = KAGGLE_WORKING / "input" / "logos"
+DEFAULT_VIDEO_DIR = KAGGLE_WORKING / "video"
+DEFAULT_SUBTITLE_DIR = KAGGLE_WORKING / "subs"
+DEFAULT_LOGO_DIR = KAGGLE_WORKING / "logos"
 DEFAULT_OUTPUT_DIR = KAGGLE_WORKING / "output"
 DEFAULT_LOG_DIR = KAGGLE_WORKING / "logs"
 
@@ -66,26 +37,12 @@ FFPROBE_PATH = os.environ.get("FFPROBE_PATH", "ffprobe")
 # =========================================================
 # НАСТРОЙКИ: ПЕРЕВОД (NLLB-200)
 # =========================================================
-# Карта BCP47-подобных кодов в коды NLLB-200 (FLORES-200).
 NLLB_LANG_MAP = {
-    "tr": "tur_Latn",
-    "en": "eng_Latn",
-    "it": "ita_Latn",
-    "es": "spa_Latn",
-    "ru": "rus_Cyrl",
-    "fr": "fra_Latn",
-    "de": "deu_Latn",
-    "pt": "por_Latn",
-    "ar": "arb_Arab",
-    "uk": "ukr_Cyrl",
-    "az": "azj_Latn",
-    "kk": "kaz_Cyrl",
-    "uz": "uzn_Latn",
-    "zh": "zho_Hans",
-    "ja": "jpn_Jpan",
-    "ko": "kor_Hang",
-    "pl": "pol_Latn",
-    "nl": "nld_Latn",
+    "tr": "tur_Latn", "en": "eng_Latn", "it": "ita_Latn", "es": "spa_Latn",
+    "ru": "rus_Cyrl", "fr": "fra_Latn", "de": "deu_Latn", "pt": "por_Latn",
+    "ar": "arb_Arab", "uk": "ukr_Cyrl", "az": "azj_Latn", "kk": "kaz_Cyrl",
+    "uz": "uzn_Latn", "zh": "zho_Hans", "ja": "jpn_Jpan", "ko": "kor_Hang",
+    "pl": "pol_Latn", "nl": "nld_Latn",
 }
 
 DEFAULT_NLLB_MODEL = os.environ.get("NLLB_MODEL", "facebook/nllb-200-distilled-600M")
@@ -112,70 +69,28 @@ SUB_PRIMARY_COLOR = "&H00FFFFFF"
 SUB_OUTLINE_COLOR = "&H00000000"
 
 # =========================================================
-# ПРОФИЛИ ВОДЯНЫХ ЗНАКОВ (по языкам)
+# ПРОФИЛИ ВОДЯНЫХ ЗНАКОВ
 # =========================================================
-# LogoPath будет вычислен относительно --logo-dir: <logo_dir>/<lang>.png (или .jpg)
 LANGUAGE_PROFILES: Dict[str, Dict[str, object]] = {
-    "en": {
-        "Anchor": "BottomLeft",
-        "LogoWidthPct": 0.295,
-        "MarginXPct": 0.018,
-        "MarginYPct": 0.074,
-        "Alpha": 0.10,
-    },
-    "it": {
-        "Anchor": "TopLeft",
-        "LogoWidthPct": 0.295,
-        "MarginXPct": 0.001,
-        "MarginYPct": 0.001,
-        "Alpha": 0.60,
-    },
-    "es": {
-        "Anchor": "TopLeft",
-        "LogoWidthPct": 0.295,
-        "MarginXPct": 0.001,
-        "MarginYPct": 0.001,
-        "Alpha": 0.60,
-    },
+    "en": {"Anchor": "BottomLeft", "LogoWidthPct": 0.295, "MarginXPct": 0.018, "MarginYPct": 0.074, "Alpha": 0.10},
+    "it": {"Anchor": "TopLeft", "LogoWidthPct": 0.295, "MarginXPct": 0.001, "MarginYPct": 0.001, "Alpha": 0.60},
+    "es": {"Anchor": "TopLeft", "LogoWidthPct": 0.295, "MarginXPct": 0.001, "MarginYPct": 0.001, "Alpha": 0.60},
 }
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov"}
-
 KNOWN_LANGUAGE_SUFFIXES = {
-    "aa","ab","ae","af","ak","am","an","ar","as","av","ay","az",
-    "ba","be","bg","bh","bi","bm","bn","bo","br","bs",
-    "ca","ce","ch","co","cr","cs","cu","cv","cy",
-    "da","de","dv","dz",
-    "ee","el","en","eo","es","et","eu",
-    "fa","ff","fi","fj","fo","fr","fy",
-    "ga","gd","gl","gn","gu","gv",
-    "ha","he","hi","ho","hr","ht","hu","hy","hz",
-    "ia","id","ie","ig","ii","ik","io","is","it","iu",
-    "ja","jv",
-    "ka","kg","ki","kj","kk","kl","km","kn","ko","kr","ks","ku","kv","kw","ky",
-    "la","lb","lg","li","ln","lo","lt","lu","lv",
-    "mg","mh","mi","mk","ml","mn","mr","ms","mt","my",
-    "na","nb","nd","ne","ng","nl","nn","no","nr","nv","ny",
-    "oc","oj","om","or","os",
-    "pa","pi","pl","ps","pt",
-    "qu",
-    "rm","rn","ro","ru","rw",
-    "sa","sc","sd","se","sg","si","sk","sl","sm","sn","so","sq","sr","ss","st","su","sv","sw",
-    "ta","te","tg","th","ti","tk","tl","tn","to","tr","ts","tt","tw","ty",
-    "ug","uk","ur","uz",
-    "ve","vi","vo",
-    "wa","wo",
-    "xh",
-    "yi","yo",
-    "za","zh","zu",
-    "ptbr","zhs","zht",
+    "aa","ab","ae","af","ak","am","an","ar","as","av","ay","az","ba","be","bg","bh","bi","bm","bn","bo","br","bs",
+    "ca","ce","ch","co","cr","cs","cu","cv","cy","da","de","dv","dz","ee","el","en","eo","es","et","eu","fa","ff",
+    "fi","fj","fo","fr","fy","ga","gd","gl","gn","gu","gv","ha","he","hi","ho","hr","ht","hu","hy","hz","ia","id",
+    "ie","ig","ii","ik","io","is","it","iu","ja","jv","ka","kg","ki","kj","kk","kl","km","kn","ko","kr","ks","ku",
+    "kv","kw","ky","la","lb","lg","li","ln","lo","lt","lu","lv","mg","mh","mi","mk","ml","mn","mr","ms","mt","my",
+    "na","nb","nd","ne","ng","nl","nn","no","nr","nv","ny","oc","oj","om","or","os","pa","pi","pl","ps","pt","qu",
+    "rm","rn","ro","ru","rw","sa","sc","sd","se","sg","si","sk","sl","sm","sn","so","sq","sr","ss","st","su","sv",
+    "sw","ta","te","tg","th","ti","tk","tl","tn","to","tr","ts","tt","tw","ty","ug","uk","ur","uz","ve","vi","vo",
+    "wa","wo","xh","yi","yo","za","zh","zu","ptbr","zhs","zht"
 }
-
 STATE_DIR_NAME = "_job_state"
 
-# =========================================================
-# КОНТЕКСТ (заполняется в main)
-# =========================================================
 class Ctx:
     video_dir: Path
     subtitle_dir: Path
@@ -186,62 +101,48 @@ class Ctx:
     heartbeat_path: Path
     src_lang: str
     dest_langs: List[str]
-    encoder: str  # "nvenc" | "libx264" | "auto"
+    encoder: str
     skip_translation: bool
-    naming: str  # "stem" | "workflow2"
+    naming: str
 
-
 # =========================================================
-# БАЗОВЫЕ УТИЛИТЫ
-# =========================================================
-# =========================================================
-# GPU-монитор (синглтон, общий на все параллельные воркеры)
+# GPU-монитор
 # =========================================================
 import threading as _threading_mon
 _GPU_MON_LOCK = _threading_mon.Lock()
 _GPU_MON_REFCOUNT = 0
-_GPU_MON_STOP: Optional[_threading_mon.Event] = None
-_GPU_MON_THREAD: Optional[_threading_mon.Thread] = None
-
+_GPU_MON_STOP = None
+_GPU_MON_THREAD = None
 
 def _gpu_monitor_loop(stop_event, interval: float) -> None:
     while not stop_event.wait(interval):
         try:
             r = subprocess.run(
-                ["nvidia-smi",
-                 "--query-gpu=index,utilization.gpu,utilization.encoder,utilization.decoder,memory.used",
+                ["nvidia-smi", "--query-gpu=index,utilization.gpu,utilization.encoder,utilization.decoder,memory.used",
                  "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=5,
             )
-            if r.returncode != 0:
-                continue
+            if r.returncode != 0: continue
             parts = []
             for line in r.stdout.strip().splitlines():
                 cols = [x.strip() for x in line.split(",")]
                 if len(cols) >= 5:
                     idx, gpu, enc, dec, mem = cols[:5]
                     parts.append(f"GPU{idx}: util={gpu}% NVENC={enc}% NVDEC={dec}% vram={mem}MB")
-            if parts:
-                write_log("  ".join(parts))
+            if parts: write_log("  ".join(parts))
         except Exception as _e:
             write_log(f"GPU monitor warn: {_e}")
-
 
 def gpu_monitor_acquire() -> None:
     global _GPU_MON_REFCOUNT, _GPU_MON_STOP, _GPU_MON_THREAD
     interval = float(os.environ.get("GPU_MONITOR_INTERVAL", "15"))
-    if interval <= 0 or not shutil.which("nvidia-smi"):
-        return
+    if interval <= 0 or not shutil.which("nvidia-smi"): return
     with _GPU_MON_LOCK:
         if _GPU_MON_REFCOUNT == 0:
             _GPU_MON_STOP = _threading_mon.Event()
-            _GPU_MON_THREAD = _threading_mon.Thread(
-                target=_gpu_monitor_loop, args=(_GPU_MON_STOP, interval),
-                name="gpu-monitor", daemon=True,
-            )
+            _GPU_MON_THREAD = _threading_mon.Thread(target=_gpu_monitor_loop, args=(_GPU_MON_STOP, interval), daemon=True)
             _GPU_MON_THREAD.start()
         _GPU_MON_REFCOUNT += 1
-
 
 def gpu_monitor_release() -> None:
     global _GPU_MON_REFCOUNT, _GPU_MON_STOP, _GPU_MON_THREAD
@@ -249,11 +150,9 @@ def gpu_monitor_release() -> None:
         _GPU_MON_REFCOUNT = max(0, _GPU_MON_REFCOUNT - 1)
         if _GPU_MON_REFCOUNT == 0 and _GPU_MON_STOP is not None:
             _GPU_MON_STOP.set()
-            if _GPU_MON_THREAD is not None:
-                _GPU_MON_THREAD.join(timeout=2)
+            if _GPU_MON_THREAD is not None: _GPU_MON_THREAD.join(timeout=2)
             _GPU_MON_STOP = None
             _GPU_MON_THREAD = None
-
 
 def write_log(text: str) -> None:
     Ctx.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -262,108 +161,62 @@ def write_log(text: str) -> None:
         f.write(line + "\n")
     print(line, flush=True)
 
-
 def update_heartbeat() -> None:
     Ctx.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
     Ctx.heartbeat_path.write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
 
-
 def configure_stdio() -> None:
     for stream_name in ("stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
-        if stream is None:
-            continue
+        if stream is None: continue
         reconfigure = getattr(stream, "reconfigure", None)
         if callable(reconfigure):
-            try:
-                reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
-
+            try: reconfigure(encoding="utf-8", errors="replace")
+            except: pass
 
 def normalize_path(path: str) -> str:
     return str(Path(path).resolve()).lower()
 
-
 def get_even_int(value: float) -> int:
     n = int(round(value))
-    if n < 2:
-        n = 2
-    if n % 2 != 0:
-        n -= 1
+    if n < 2: n = 2
+    if n % 2 != 0: n -= 1
     return n
 
-
-def run_checked(args: List[str], allow_non_zero: bool = False) -> subprocess.CompletedProcess:
+def run_checked(args: List[str], allow_non_zero: bool = False):
     proc = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if proc.returncode != 0 and not allow_non_zero:
-        raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(args)}\n{proc.stderr}")
+        raise RuntimeError(f"Command failed: {proc.stderr}")
     return proc
 
-
 def ensure_commands_exist() -> None:
-    if shutil.which(FFMPEG_PATH) is None:
-        raise RuntimeError(f"FFmpeg not found: {FFMPEG_PATH}")
-    if shutil.which(FFPROBE_PATH) is None:
-        raise RuntimeError(f"FFprobe not found: {FFPROBE_PATH}")
-
+    if shutil.which(FFMPEG_PATH) is None: raise RuntimeError("FFmpeg not found")
+    if shutil.which(FFPROBE_PATH) is None: raise RuntimeError("FFprobe not found")
 
 def detect_encoder(preferred: str) -> str:
-    """auto/nvenc/libx264 -> реально доступный."""
-    if preferred == "libx264":
-        return "libx264"
-    # проверим наличие h264_nvenc
+    if preferred == "libx264": return "libx264"
     try:
-        proc = subprocess.run(
-            [FFMPEG_PATH, "-hide_banner", "-encoders"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-        )
+        proc = subprocess.run([FFMPEG_PATH, "-hide_banner", "-encoders"], capture_output=True, text=True)
         has_nvenc = "h264_nvenc" in (proc.stdout or "")
-    except Exception:
+    except:
         has_nvenc = False
-    if preferred == "nvenc":
-        if not has_nvenc:
-            raise RuntimeError(
-                "h264_nvenc недоступен в установленном ffmpeg. "
-                "Поставьте сборку BtbN со статическим nvenc "
-                "(см. ячейку установки в README) или используйте --encoder libx264."
-            )
-        return "nvenc"
-    # auto
+    if preferred == "nvenc" and not has_nvenc:
+        raise RuntimeError("h264_nvenc недоступен")
     return "nvenc" if has_nvenc else "libx264"
 
-
 def get_media_size(path: Path) -> Tuple[int, int]:
-    proc = run_checked([
-        FFPROBE_PATH,
-        "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height",
-        "-of", "csv=s=x:p=0",
-        str(path),
-    ])
-    raw = proc.stdout.strip()
-    if not raw or "x" not in raw:
-        raise RuntimeError(f"ffprobe returned empty size for: {path}")
-    w, h = raw.split("x", 1)
+    proc = run_checked([FFPROBE_PATH, "-v", "error", "-select_streams", "v:0",
+                        "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", str(path)])
+    w, h = proc.stdout.strip().split("x")
     return int(w), int(h)
 
-
 def get_video_codec(path: Path) -> str:
-    """Возвращает имя видеокодека (h264, hevc, av1, vp9, ...)"""
     try:
-        proc = run_checked([
-            FFPROBE_PATH,
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=codec_name",
-            "-of", "csv=p=0",
-            str(path),
-        ])
+        proc = run_checked([FFPROBE_PATH, "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(path)])
         return proc.stdout.strip().lower()
-    except Exception:
+    except:
         return ""
-
 
 def new_temp_subtitle_copy(original_path: Path) -> Path:
     temp_dir = Path(tempfile.gettempdir()) / "AutoHardSubTempSubs"
@@ -372,727 +225,277 @@ def new_temp_subtitle_copy(original_path: Path) -> Path:
     shutil.copy2(original_path, temp_path)
     return temp_path
 
-
 def escape_subtitle_path_for_filter(path: Path) -> str:
-    full = str(path.resolve())
-    full = full.replace("\\", "/")
-    full = full.replace(":", r"\:")
-    full = full.replace("'", r"\'")
-    return full
-
+    return str(path.resolve()).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
 
 def get_subtitle_style(video_height: int) -> str:
-    font_size = round(video_height * SUB_FONT_PCT_OF_HEIGHT)
-    if font_size < 18:
-        font_size = 18
+    font_size = max(18, round(video_height * SUB_FONT_PCT_OF_HEIGHT))
     outline = round(video_height * SUB_OUTLINE_PCT_OF_HEIGHT, 2)
-    if outline < 0:
-        outline = 0
-    margin_v = int(round(video_height * SUB_MARGIN_V_PCT_OF_HEIGHT))
-    if margin_v < 18:
-        margin_v = 18
-    return (
-        f"Fontname=DejaVu Sans,Fontsize={font_size},Bold=1,BorderStyle=1,"
-        f"Outline={outline},Shadow=0,PrimaryColour={SUB_PRIMARY_COLOR},"
-        f"OutlineColour={SUB_OUTLINE_COLOR},Alignment=2,MarginV={margin_v}"
-    )
+    margin_v = max(18, int(round(video_height * SUB_MARGIN_V_PCT_OF_HEIGHT)))
+    return (f"Fontname=DejaVu Sans,Fontsize={font_size},Bold=1,BorderStyle=1,"
+            f"Outline={outline},Shadow=0,PrimaryColour={SUB_PRIMARY_COLOR},"
+            f"OutlineColour={SUB_OUTLINE_COLOR},Alignment=2,MarginV={margin_v}")
 
-
-def get_overlay_position(video_w: int, video_h: int, logo_w: int, logo_h: int, profile: Dict[str, object]) -> Tuple[int, int]:
+def get_overlay_position(video_w, video_h, logo_w, logo_h, profile):
     mx = int(round(video_w * float(profile["MarginXPct"])))
     my = int(round(video_h * float(profile["MarginYPct"])))
-    anchor = str(profile["Anchor"]).replace(" ", "").lower()
-    if anchor == "bottomleft":
-        x, y = mx, video_h - logo_h - my
-    elif anchor == "topleft":
-        x, y = mx, my
-    elif anchor == "bottomright":
-        x, y = video_w - logo_w - mx, video_h - logo_h - my
-    elif anchor == "topright":
-        x, y = video_w - logo_w - mx, my
-    else:
-        raise ValueError(f"Unknown Anchor: {profile['Anchor']}")
-    return max(0, int(x)), max(0, int(y))
+    anchor = str(profile["Anchor"]).lower()
+    if anchor == "bottomleft": return mx, video_h - logo_h - my
+    if anchor == "topleft": return mx, my
+    if anchor == "bottomright": return video_w - logo_w - mx, video_h - logo_h - my
+    return video_w - logo_w - mx, my
 
+# =========================================================
+# ЛОГОТИПЫ (Colab)
+# =========================================================
+def download_logos():
+    os.makedirs(str(DEFAULT_LOGO_DIR), exist_ok=True)
+    urls = {
+        str(DEFAULT_LOGO_DIR / "logo riki.png"): "https://raw.githubusercontent.com/Iwaki9/iwaki/refs/heads/master/a/logo%20riki.png",
+        str(DEFAULT_LOGO_DIR / "logo.png"): "https://raw.githubusercontent.com/Iwaki9/iwaki/refs/heads/master/a/logo.png"
+    }
+    for path, url in urls.items():
+        if not os.path.exists(path):
+            subprocess.run(["wget", "-q", "-O", path, url], check=True)
 
 # =========================================================
 # ИМЕНА ФАЙЛОВ
 # =========================================================
-def split_subtitle_stem_and_lang(path: Path) -> Tuple[str, Optional[str]]:
+def split_subtitle_stem_and_lang(path: Path):
     stem = path.stem
     match = re.match(r"^(?P<base>.+)\.(?P<lang>[A-Za-z]{2,5})$", stem)
-    if not match:
-        return stem, None
+    if not match: return stem, None
     lang = match.group("lang").lower()
     base = match.group("base")
-    known = set(KNOWN_LANGUAGE_SUFFIXES)
-    known.update({Ctx.src_lang.lower(), *[x.lower() for x in Ctx.dest_langs]})
-    if lang in known:
-        return base, lang
-    return stem, None
-
+    known = set(KNOWN_LANGUAGE_SUFFIXES) | {Ctx.src_lang.lower()} | {x.lower() for x in Ctx.dest_langs}
+    return (base, lang) if lang in known else (stem, None)
 
 def is_raw_subtitle_source(path: Path) -> bool:
-    if path.suffix.lower() != ".srt":
-        return False
-    _, lang = split_subtitle_stem_and_lang(path)
-    return lang is None
+    return path.suffix.lower() == ".srt" and split_subtitle_stem_and_lang(path)[1] is None
 
-
-def build_translated_subtitle_path(raw_subtitle: Path, dest_lang: str) -> Path:
-    return raw_subtitle.with_name(f"{raw_subtitle.stem}.{dest_lang}{raw_subtitle.suffix}")
-
+def build_translated_subtitle_path(raw, dest_lang):
+    return raw.with_name(f"{raw.stem}.{dest_lang}{raw.suffix}")
 
 # =========================================================
-# ПЕРЕВОД: NLLB-200 ЛОКАЛЬНО
+# ПЕРЕВОД NLLB
 # =========================================================
-_NLLB_PIPE = None  # ленивая инициализация
-
+_NLLB_PIPE = None
 
 def _get_nllb_pipeline():
     global _NLLB_PIPE
-    if _NLLB_PIPE is not None:
-        return _NLLB_PIPE
-    write_log(f"NLLB loading model: {DEFAULT_NLLB_MODEL} ...")
-    try:
-        import torch  # type: ignore
-        from transformers import (  # type: ignore
-            AutoModelForSeq2SeqLM,
-            AutoTokenizer,
-        )
-    except ImportError as e:
-        raise RuntimeError(
-            "Не найден transformers/torch. Установите: "
-            "pip install -q transformers sentencepiece accelerate"
-        ) from e
-
+    if _NLLB_PIPE: return _NLLB_PIPE
+    import torch
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
     device = 0 if torch.cuda.is_available() else -1
     tokenizer = AutoTokenizer.from_pretrained(DEFAULT_NLLB_MODEL)
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        DEFAULT_NLLB_MODEL,
-        torch_dtype=torch.float16 if device == 0 else torch.float32,
-    )
-    if device == 0:
-        model = model.to("cuda")
+    model = AutoModelForSeq2SeqLM.from_pretrained(DEFAULT_NLLB_MODEL, torch_dtype=torch.float16 if device == 0 else torch.float32)
+    if device == 0: model = model.to("cuda")
     _NLLB_PIPE = {"tokenizer": tokenizer, "model": model, "device": device}
-    write_log(f"NLLB ready (device={'cuda' if device == 0 else 'cpu'})")
     return _NLLB_PIPE
 
+def _nllb_code(lang): return NLLB_LANG_MAP[lang.lower()]
 
-def _nllb_code(lang: str) -> str:
-    code = NLLB_LANG_MAP.get(lang.lower())
-    if not code:
-        raise RuntimeError(
-            f"Нет маппинга {lang!r} в NLLB. Добавьте код в NLLB_LANG_MAP "
-            f"(https://github.com/facebookresearch/flores/blob/main/flores200/README.md)."
-        )
-    return code
-
-
-def translate_batch_local(texts: List[str], src: str, dest: str) -> List[str]:
-    if not texts:
-        return []
+def translate_batch_local(texts, src, dest):
+    if not texts: return []
     pipe = _get_nllb_pipeline()
-    tokenizer = pipe["tokenizer"]
-    model = pipe["model"]
-    device = pipe["device"]
-
-    src_code = _nllb_code(src)
-    dest_code = _nllb_code(dest)
-
-    # NLLB tokenizer ожидает src_lang заранее
-    tokenizer.src_lang = src_code
-    import torch  # type: ignore
-    results: List[str] = []
-    for start in range(0, len(texts), TRANSLATE_BATCH_SIZE):
-        chunk = texts[start:start + TRANSLATE_BATCH_SIZE]
-        inputs = tokenizer(
-            chunk,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=TRANSLATE_MAX_LENGTH,
-        )
-        if device == 0:
-            inputs = {k: v.to("cuda") for k, v in inputs.items()}
-
-        # совместимость с разными версиями transformers
-        forced_bos = None
-        try:
-            forced_bos = tokenizer.convert_tokens_to_ids(dest_code)
-        except Exception:
-            pass
-        if forced_bos is None or forced_bos == tokenizer.unk_token_id:
-            try:
-                forced_bos = tokenizer.lang_code_to_id[dest_code]  # старый API
-            except Exception as e:
-                raise RuntimeError(f"Не могу получить forced_bos_token_id для {dest_code}: {e}")
-
+    tokenizer, model, device = pipe["tokenizer"], pipe["model"], pipe["device"]
+    tokenizer.src_lang = _nllb_code(src)
+    import torch
+    results = []
+    for i in range(0, len(texts), TRANSLATE_BATCH_SIZE):
+        chunk = texts[i:i+TRANSLATE_BATCH_SIZE]
+        inputs = tokenizer(chunk, return_tensors="pt", padding=True, truncation=True, max_length=TRANSLATE_MAX_LENGTH)
+        if device == 0: inputs = {k: v.to("cuda") for k, v in inputs.items()}
+        forced_bos = tokenizer.convert_tokens_to_ids(_nllb_code(dest))
         with torch.no_grad():
-            out = model.generate(
-                **inputs,
-                forced_bos_token_id=forced_bos,
-                max_length=TRANSLATE_MAX_LENGTH,
-                num_beams=2,
-            )
-        decoded = tokenizer.batch_decode(out, skip_special_tokens=True)
-        results.extend(decoded)
+            out = model.generate(**inputs, forced_bos_token_id=forced_bos, max_length=TRANSLATE_MAX_LENGTH, num_beams=2)
+        results.extend(tokenizer.batch_decode(out, skip_special_tokens=True))
     return results
 
-
 # =========================================================
-# CHECKPOINT/META для возобновления перевода
+# CHECKPOINT / META
 # =========================================================
-def get_state_dir(parent: Path) -> Path:
-    state_dir = parent / STATE_DIR_NAME
-    state_dir.mkdir(parents=True, exist_ok=True)
-    return state_dir
+def get_state_dir(p): return (p / STATE_DIR_NAME).mkdir(parents=True, exist_ok=True) or (p / STATE_DIR_NAME)
+def get_sidecar_path(f, s): return get_state_dir(f.parent) / f"{f.name}{s}"
+def get_meta_path(f): return get_sidecar_path(f, ".meta.json")
+def load_meta(f):
+    if not get_meta_path(f).exists(): return None
+    try: return json.loads(get_meta_path(f).read_text())
+    except: return None
+def save_meta(f, m): get_meta_path(f).write_text(json.dumps(m, ensure_ascii=False, indent=2))
+def make_meta(i, o, src, dst, total, last=-1):
+    return {"input_file": normalize_path(str(i)), "output_file": normalize_path(str(o)), "src_lang": src, "dest_lang": dst, "total_subs": total, "last_done_index": last, "engine": "nllb-200"}
 
+def is_resume_compatible(meta, i, o, src, dst, total):
+    return meta and meta.get("input_file") == normalize_path(str(i)) and meta.get("output_file") == normalize_path(str(o)) and meta.get("src_lang") == src and meta.get("dest_lang") == dst and meta.get("total_subs") == total
 
-def get_sidecar_path(target_file: Path, suffix: str) -> Path:
-    state_dir = get_state_dir(target_file.parent)
-    return state_dir / f"{target_file.name}{suffix}"
+def save_checkpoint(subs, out, meta, idx, total):
+    meta["last_done_index"] = idx
+    subs.save(str(out), encoding="utf-8")
+    save_meta(out, meta)
 
+def is_translation_complete(i, o, src, dst):
+    if not o.exists(): return False
+    meta = load_meta(o)
+    if meta is None: return True
+    try: total = len(pysrt.open(str(i), encoding="utf-8"))
+    except: return False
+    if not is_resume_compatible(meta, i, o, src, dst, total): return True
+    return meta.get("last_done_index", -1) >= total - 1
 
-def get_meta_path(output_file: Path) -> Path:
-    return get_sidecar_path(output_file, ".meta.json")
-
-
-def load_meta(output_file: Path) -> Optional[dict]:
-    meta_path = get_meta_path(output_file)
-    if not meta_path.exists():
-        return None
-    try:
-        return json.loads(meta_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        write_log(f"WARN failed to read meta {meta_path}: {e}")
-        return None
-
-
-def save_meta(output_file: Path, meta: dict) -> None:
-    get_meta_path(output_file).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def make_meta(input_file: Path, output_file: Path, src_lang: str, dest_lang: str, total: int, last_done_index: int = -1) -> dict:
-    return {
-        "input_file": normalize_path(str(input_file)),
-        "output_file": normalize_path(str(output_file)),
-        "src_lang": src_lang,
-        "dest_lang": dest_lang,
-        "total_subs": total,
-        "last_done_index": last_done_index,
-        "engine": "nllb-200",
-    }
-
-
-def is_resume_compatible(meta: Optional[dict], input_file: Path, output_file: Path, src_lang: str, dest_lang: str, total: int) -> bool:
-    if not meta:
-        return False
-    return (
-        meta.get("input_file") == normalize_path(str(input_file))
-        and meta.get("output_file") == normalize_path(str(output_file))
-        and meta.get("src_lang") == src_lang
-        and meta.get("dest_lang") == dest_lang
-        and meta.get("total_subs") == total
-        and isinstance(meta.get("last_done_index"), int)
-    )
-
-
-def save_checkpoint(subs, output_file: Path, meta: dict, current_index: int, total: int) -> None:
-    meta["last_done_index"] = current_index
-    subs.save(str(output_file), encoding="utf-8")
-    save_meta(output_file, meta)
-    write_log(f"TRANS SAVE [{meta['dest_lang']}] {current_index + 1}/{total}")
-
-
-def is_translation_complete(input_file: Path, output_file: Path, src_lang: str, dest_lang: str) -> bool:
-    if not output_file.exists():
-        return False
-    meta = load_meta(output_file)
-    if meta is None:
-        # Файл уже есть, мета отсутствует — не трогаем.
-        return True
-    try:
-        total = len(pysrt.open(str(input_file), encoding="utf-8"))
-    except Exception:
-        return False
-    if not is_resume_compatible(meta, input_file, output_file, src_lang, dest_lang, total):
-        return True
-    return int(meta.get("last_done_index", -1)) >= total - 1
-
-
-def translate_subtitle_file(input_file: Path, output_file: Path, src_lang: str, dest_lang: str) -> None:
-    write_log(f"TRANS START {input_file.name} -> {output_file.name} [{src_lang}->{dest_lang}]")
-    original_subs = pysrt.open(str(input_file), encoding="utf-8")
-    total = len(original_subs)
-    meta = load_meta(output_file)
-
-    if output_file.exists() and is_resume_compatible(meta, input_file, output_file, src_lang, dest_lang, total):
-        try:
-            subs = pysrt.open(str(output_file), encoding="utf-8")
-        except Exception:
-            subs = pysrt.open(str(input_file), encoding="utf-8")
-            meta = make_meta(input_file, output_file, src_lang, dest_lang, total, -1)
-            save_meta(output_file, meta)
-        last_done = meta.get("last_done_index", -1) if meta else -1
-        if last_done >= total - 1:
-            write_log(f"TRANS DONE {dest_lang}: already complete {total}/{total}")
-            return
-        start_index = max(0, last_done + 1)
-        write_log(f"TRANS RESUME {dest_lang}: from {start_index + 1}/{total}")
+def translate_subtitle_file(i, o, src, dst):
+    subs = pysrt.open(str(i), encoding="utf-8")
+    total = len(subs)
+    meta = load_meta(o)
+    start = 0
+    if o.exists() and is_resume_compatible(meta, i, o, src, dst, total):
+        try: subs = pysrt.open(str(o), encoding="utf-8")
+        except: pass
+        start = meta.get("last_done_index", -1) + 1
     else:
-        subs = pysrt.open(str(input_file), encoding="utf-8")
-        meta = make_meta(input_file, output_file, src_lang, dest_lang, total, -1)
-        save_meta(output_file, meta)
-        start_index = 0
+        meta = make_meta(i, o, src, dst, total)
+        save_meta(o, meta)
+    for j in range(start, total, TRANSLATE_BATCH_SIZE):
+        batch = [subs[k].text for k in range(j, min(j+TRANSLATE_BATCH_SIZE, total)) if subs[k].text.strip()]
+        if not batch: continue
+        translated = translate_batch_local(batch, src, dst)
+        for idx, t in enumerate(translated):
+            subs[j + idx].text = t.strip()
+        save_checkpoint(subs, o, meta, j + len(translated) - 1, total)
+    write_log(f"TRANS DONE {o}")
 
-    i = start_index
-    while i < total:
-        # собрать батч непустых строк
-        indices: List[int] = []
-        texts: List[str] = []
-        j = i
-        while j < total and len(texts) < TRANSLATE_BATCH_SIZE:
-            text = subs[j].text.strip()
-            if text:
-                indices.append(j)
-                texts.append(subs[j].text)
-            j += 1
-
-        if not texts:
-            # хвост из пустых
-            save_checkpoint(subs, output_file, meta, total - 1, total)
-            break
-
-        try:
-            translated = translate_batch_local(texts, src_lang, dest_lang)
-        except Exception as e:
-            write_log(f"TRANS ERROR [{src_lang}->{dest_lang}] batch={len(texts)} -> {e}")
-            # fallback: по одному, чтобы не падать всем батчем
-            translated = []
-            for t in texts:
-                try:
-                    translated.append(translate_batch_local([t], src_lang, dest_lang)[0])
-                except Exception as ee:
-                    write_log(f"TRANS SINGLE FAIL -> {ee}; keeping original")
-                    translated.append(t)
-
-        for sub_index, translated_text in zip(indices, translated):
-            subs[sub_index].text = translated_text.strip()
-
-        last_index_in_batch = indices[-1]
-        if ((last_index_in_batch + 1) % CHECKPOINT_EVERY == 0) or (last_index_in_batch + 1 == total):
-            save_checkpoint(subs, output_file, meta, last_index_in_batch, total)
-        i = last_index_in_batch + 1
-
-    if meta.get("last_done_index", -1) < total - 1:
-        save_checkpoint(subs, output_file, meta, total - 1, total)
-    write_log(f"TRANS DONE {output_file}")
-
-
-def process_raw_subtitle(raw_subtitle: Path) -> int:
-    if not is_raw_subtitle_source(raw_subtitle):
-        return 0
-    started = 0
-    for dest_lang in Ctx.dest_langs:
-        translated_output = build_translated_subtitle_path(raw_subtitle, dest_lang)
-        if is_translation_complete(raw_subtitle, translated_output, Ctx.src_lang, dest_lang):
-            write_log(f"TRANS SKIP {translated_output.name} already complete")
-            continue
-        try:
-            translate_subtitle_file(raw_subtitle, translated_output, Ctx.src_lang, dest_lang)
-            started += 1
-        except Exception as e:
-            write_log(f"TRANS ERROR {raw_subtitle.name} [{dest_lang}] -> {e}")
-    return started
-
+def process_raw_subtitle(raw):
+    if not is_raw_subtitle_source(raw): return 0
+    for lang in Ctx.dest_langs:
+        out = build_translated_subtitle_path(raw, lang)
+        if not is_translation_complete(raw, out, Ctx.src_lang, lang):
+            translate_subtitle_file(raw, out, Ctx.src_lang, lang)
+    return 1
 
 # =========================================================
 # ХАРДСАБ
 # =========================================================
-def iter_video_files() -> List[Path]:
-    if not Ctx.video_dir.exists():
-        return []
-    return [p for p in Ctx.video_dir.iterdir()
-            if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS]
+def iter_video_files():
+    return [p for p in Ctx.video_dir.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS] if Ctx.video_dir.exists() else []
 
+def iter_subtitle_files():
+    return [p for p in Ctx.subtitle_dir.iterdir() if p.is_file() and p.suffix.lower() == ".srt"] if Ctx.subtitle_dir.exists() else []
 
-def iter_subtitle_files() -> List[Path]:
-    if not Ctx.subtitle_dir.exists():
-        return []
-    return [p for p in Ctx.subtitle_dir.iterdir()
-            if p.is_file() and p.suffix.lower() == ".srt"]
-
-
-def find_video_for_base(base: str) -> Optional[Path]:
-    for video in iter_video_files():
-        if video.stem.lower() == base.lower():
-            return video
-    return None
-
-
-def workflow2_common_base(name: str) -> str:
-    """
-    Для схемы 'workflow2': возвращает общий префикс файла без суффиксов
-    '_video', '_audio', '_audio_original' и языкового хвоста.
-    Примеры:
-      'Foo_video'              -> 'Foo'
-      'Foo_audio'              -> 'Foo'
-      'Foo_audio.en'           -> 'Foo'  (без .srt)
-      'Foo_audio_original'     -> 'Foo'
-    """
+def workflow2_common_base(name):
     s = name
-    # отрезаем расширение если ещё осталось
-    if s.lower().endswith(".srt") or s.lower().endswith(".mp4"):
-        s = s.rsplit(".", 1)[0]
-    # языковой хвост
+    if s.lower().endswith((".srt", ".mp4")): s = s.rsplit(".", 1)[0]
     m = re.match(r"^(?P<base>.+)\.(?P<lang>[A-Za-z]{2,5})$", s)
-    if m:
-        known = set(KNOWN_LANGUAGE_SUFFIXES)
-        known.update({Ctx.src_lang.lower(), *[x.lower() for x in Ctx.dest_langs]})
-        if m.group("lang").lower() in known:
-            s = m.group("base")
-    # суффиксы рабочего пайплайна
+    if m and m.group("lang").lower() in set(KNOWN_LANGUAGE_SUFFIXES) | {Ctx.src_lang.lower()} | {x.lower() for x in Ctx.dest_langs}:
+        s = m.group("base")
     for suf in ("_audio_original", "_audio", "_video"):
-        if s.endswith(suf):
-            s = s[: -len(suf)]
-            break
+        if s.endswith(suf): s = s[:-len(suf)]; break
     return s
 
-
-def find_video_workflow2(common_base: str) -> Optional[Path]:
-    """Ищем <common_base>_video.<ext> среди видео."""
-    cb_lower = common_base.lower()
-    for video in iter_video_files():
-        if workflow2_common_base(video.stem).lower() == cb_lower:
-            return video
+def resolve_logo_path(lang):
+    env = os.environ.get(f"LOGO_{lang.upper()}")
+    if env and Path(env).exists(): return Path(env)
+    for ext in (".png", ".jpg", ".jpeg"):
+        p = Ctx.logo_dir / f"{lang}{ext}"
+        if p.exists(): return p
     return None
 
-
-def resolve_logo_path(lang: str) -> Optional[Path]:
-    """Ищем <logo_dir>/<lang>.{png,jpg,jpeg,webp} либо берём из переменной окружения LOGO_<LANG>."""
-    env_override = os.environ.get(f"LOGO_{lang.upper()}")
-    if env_override:
-        p = Path(env_override)
-        if p.exists():
-            return p
-    for ext in (".png", ".jpg", ".jpeg", ".webp"):
-        candidate = Ctx.logo_dir / f"{lang}{ext}"
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def render_one(video: Path, subtitle: Path, lang: str,
-               output_base: Optional[str] = None,
-               gpu_index: Optional[int] = None) -> bool:
+def render_one(video, subtitle, lang, output_base=None, gpu_index=None):
     profile = LANGUAGE_PROFILES.get(lang)
-    if profile is None:
-        write_log(f"RENDER SKIP no profile for lang={lang}")
-        return False
-
+    if not profile: return False
     logo = resolve_logo_path(lang)
-    base_name = output_base if output_base else video.stem
-    output_path = Ctx.output_dir / f"{base_name}.{lang}.mp4"
-    done_path = get_sidecar_path(output_path, ".done")
-    failed_path = get_sidecar_path(output_path, ".failed")
-    lock_path = get_sidecar_path(output_path, ".rendering")
+    base = output_base or video.stem
+    out = Ctx.output_dir / f"{base}.{lang}.mp4"
+    if out.exists(): return False
 
-    if done_path.exists() or output_path.exists():
-        write_log(f"RENDER SKIP already exists {output_path.name}")
-        return False
+    w, h = get_media_size(video)
+    style = get_subtitle_style(h)
+    temp = new_temp_subtitle_copy(subtitle)
+    esc = escape_subtitle_path_for_filter(temp)
 
-    video_w, video_h = get_media_size(video)
-    style = get_subtitle_style(video_h)
-    temp_sub = new_temp_subtitle_copy(subtitle)
-    escaped_sub = escape_subtitle_path_for_filter(temp_sub)
-
-    # GPU-декодирование исходного видео (если NVENC выбран)
-    # Tesla T4 не умеет AV1 hwdec, поэтому проверяем кодек.
-    # Поддерживаемые T4 NVDEC: h264, hevc, vp8, vp9, mpeg2, mpeg4, vc1.
-    decode_args: List[str] = []
+    decode = []
     if Ctx.encoder == "nvenc" and os.environ.get("DISABLE_HWACCEL", "0") != "1":
         codec = get_video_codec(video)
-        hwdec_supported = {"h264", "hevc", "h265", "vp8", "vp9", "mpeg2video", "mpeg4", "vc1"}
-        if codec in hwdec_supported:
-            decode_args = ["-hwaccel", "cuda"]
-            write_log(f"RENDER hwdec=cuda (codec={codec})")
+        if codec in {"h264", "hevc", "h265", "vp8", "vp9", "mpeg2video", "mpeg4", "vc1"}:
+            decode = ["-hwaccel", "cuda"]
+
+    if logo:
+        lw, lh = get_media_size(logo)
+        lw2 = get_even_int(w * profile["LogoWidthPct"])
+        lh2 = get_even_int((lh / lw) * lw2)
+        x, y = get_overlay_position(w, h, lw2, lh2, profile)
+        if Ctx.encoder == "nvenc" and os.environ.get("USE_GPU_OVERLAY", "0") == "1":
+            fc = f"[1:v]format=rgba,colorchannelmixer=aa={profile['Alpha']},scale={lw2}:{lh2},format=yuva420p,hwupload_cuda[wm];[0:v]subtitles='{esc}':force_style='{style}',format=yuv420p,hwupload_cuda[v0];[v0][wm]overlay_cuda=x={x}:y={y}[v]"
         else:
-            write_log(f"RENDER hwdec=off (codec={codec} not supported by T4 NVDEC, using CPU decode)")
+            fc = f"[1:v]format=rgba,colorchannelmixer=aa={profile['Alpha']},scale={lw2}:{lh2}[wm];[0:v]subtitles='{esc}':force_style='{style}'[v0];[v0][wm]overlay={x}:{y}[v]"
+        ins = [*decode, "-i", str(video), "-i", str(logo)]
+    else:
+        fc = f"[0:v]subtitles='{esc}':force_style='{style}'[v]"
+        ins = [*decode, "-i", str(video)]
 
-    if logo is not None:
-        try:
-            logo_w0, logo_h0 = get_media_size(logo)
-            logo_w = get_even_int(video_w * float(profile["LogoWidthPct"]))
-            logo_h = get_even_int((logo_h0 / logo_w0) * logo_w)
-            pos_x, pos_y = get_overlay_position(video_w, video_h, logo_w, logo_h, profile)
-            use_gpu_overlay = (
-                Ctx.encoder == "nvenc"
-                and os.environ.get("USE_GPU_OVERLAY", "0") == "1"
-            )
-            if use_gpu_overlay:
-                # GPU pipeline: после libass отправляем кадр на GPU и оверлей+энкод там же.
-                # Логотип готовится на CPU (alpha + scale), потом hwupload_cuda.
-                # Это снимает нагрузку с CPU на overlay и убирает финальный upload перед NVENC.
-                filter_complex = (
-                    f"[1:v]format=rgba,colorchannelmixer=aa={profile['Alpha']},"
-                    f"scale={logo_w}:{logo_h},format=yuva420p,hwupload_cuda[wm];"
-                    f"[0:v]subtitles='{escaped_sub}':force_style='{style}',"
-                    f"format=yuv420p,hwupload_cuda[v0];"
-                    f"[v0][wm]overlay_cuda=x={pos_x}:y={pos_y}[v]"
-                )
-                write_log("RENDER overlay=GPU (overlay_cuda)")
-            else:
-                filter_complex = (
-                    f"[1:v]format=rgba,colorchannelmixer=aa={profile['Alpha']},"
-                    f"scale={logo_w}:{logo_h}[wm];"
-                    f"[0:v]subtitles='{escaped_sub}':force_style='{style}'[v0];"
-                    f"[v0][wm]overlay={pos_x}:{pos_y}[v]"
-                )
-            inputs = [*decode_args, "-i", str(video), "-i", str(logo)]
-        except Exception as e:
-            write_log(f"RENDER WARN logo unusable ({logo}): {e}; rendering without logo")
-            logo = None
+    venc = ["-c:v", "h264_nvenc", "-preset", NVENC_PRESET, "-b:v", VIDEO_BITRATE, "-maxrate", MAXRATE, "-bufsize", BUFSIZE] if Ctx.encoder == "nvenc" else ["-c:v", "libx264", "-preset", "veryfast", "-b:v", VIDEO_BITRATE, "-maxrate", MAXRATE, "-bufsize", BUFSIZE, "-pix_fmt", "yuv420p"]
 
-    if logo is None:
-        filter_complex = f"[0:v]subtitles='{escaped_sub}':force_style='{style}'[v]"
-        inputs = [*decode_args, "-i", str(video)]
+    args = [FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error", *ins, "-filter_complex", fc, "-map", "[v]", "-map", "0:a?", *venc]
+    if USE_AUDIO_COPY: args += ["-c:a", "copy"]
+    else: args += ["-c:a", "aac", "-b:a", "128k"]
+    args.append(str(out))
 
-    lock_path.write_text("rendering", encoding="utf-8")
-    # окружение для ffmpeg: можно закрепить за конкретным GPU
-    ffmpeg_env = os.environ.copy()
-    if gpu_index is not None:
-        ffmpeg_env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
-    gpu_tag = f" [gpu={gpu_index}]" if gpu_index is not None else ""
     try:
-        write_log(f"RENDER START {video.name} [{lang}]{gpu_tag} -> {output_path.name}")
-
-        # выбор кодировщика
-        if Ctx.encoder == "nvenc":
-            venc_args = [
-                "-c:v", "h264_nvenc",
-                "-preset", NVENC_PRESET,
-                "-b:v", VIDEO_BITRATE,
-                "-maxrate", MAXRATE,
-                "-bufsize", BUFSIZE,
-            ]
-        else:
-            venc_args = [
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-b:v", VIDEO_BITRATE,
-                "-maxrate", MAXRATE,
-                "-bufsize", BUFSIZE,
-                "-pix_fmt", "yuv420p",
-            ]
-
-        # Параллелизация фильтров (libass — однопоточный, но конвейер можно ускорить)
-        threads_env = os.environ.get("FFMPEG_THREADS", "0")  # 0 = auto
-
-        # Уровень логов ffmpeg: по умолчанию error+stats, можно переопределить env
-        loglevel = os.environ.get("FFMPEG_LOGLEVEL", "error")
-        # Прогресс по кадрам в stdout (компактно, одна строка)
-        quiet_mode = os.environ.get("FFMPEG_QUIET", "1") != "0"
-
-        args = [
-            FFMPEG_PATH,
-            "-y",
-            "-hide_banner",
-            "-loglevel", loglevel,
-            "-stats",
-            "-threads", threads_env,
-            "-filter_threads", threads_env,
-            "-filter_complex_threads", threads_env,
-            *inputs,
-            "-filter_complex", filter_complex,
-            "-map", "[v]",
-            "-map", "0:a?",
-            *venc_args,
-        ]
-        if USE_AUDIO_COPY:
-            args += ["-c:a", "copy"]
-        else:
-            args += ["-c:a", "aac", "-b:a", "128k"]
-        args.append(str(output_path))
-
-        if quiet_mode:
-            # Подавляем шум: stderr собираем во временный файл и читаем только последние строки если ошибка
-            import tempfile as _tf
-            with _tf.NamedTemporaryFile(mode="w+", delete=False, suffix=".ffmpeg.log", encoding="utf-8") as _logf:
-                _err_path = _logf.name
-
-            # Регистрируемся у общего GPU-монитора (синглтон, один на весь скрипт)
-            gpu_monitor_acquire()
-            try:
-                with open(_err_path, "w", encoding="utf-8") as _errf:
-                    proc = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=_errf, env=ffmpeg_env)
-                exit_code = proc.returncode
-            finally:
-                gpu_monitor_release()
-
-            if exit_code != 0:
-                # При ошибке вытащим хвост лога
-                try:
-                    with open(_err_path, "r", encoding="utf-8", errors="replace") as _errf:
-                        tail = _errf.readlines()[-40:]
-                    write_log("FFmpeg stderr tail:\n" + "".join(tail))
-                except Exception:
-                    pass
-            try:
-                os.unlink(_err_path)
-            except Exception:
-                pass
-        else:
-            proc = subprocess.run(args, env=ffmpeg_env)
-            exit_code = proc.returncode
-
-        output_ok = output_path.exists() and output_path.stat().st_size > 1 * 1024 * 1024
-        if exit_code == 0 or output_ok:
-            done_path.write_text(f"Done at {time.strftime('%Y-%m-%d %H:%M:%S')}", encoding="utf-8")
-            if failed_path.exists():
-                failed_path.unlink(missing_ok=True)
-            write_log(f"RENDER DONE {output_path}")
-            return True
-        else:
-            if output_path.exists():
-                output_path.unlink(missing_ok=True)
-            failed_path.write_text(
-                f"Failed at {time.strftime('%Y-%m-%d %H:%M:%S')}; exit={exit_code}",
-                encoding="utf-8",
-            )
-            write_log(f"RENDER FAIL exit={exit_code} {video.name} [{lang}]")
-            return False
+        proc = subprocess.run(args, capture_output=True, text=True)
+        return proc.returncode == 0 and out.exists()
     finally:
-        lock_path.unlink(missing_ok=True)
-        temp_sub.unlink(missing_ok=True)
-        update_heartbeat()
+        temp.unlink(missing_ok=True)
 
-
-def process_render_jobs() -> int:
-    # Список задач: (video, subtitle, lang, common_base)
-    tasks: List[Tuple[Path, Path, str, str]] = []
-    for video in iter_video_files():
-        if Ctx.naming == "workflow2":
-            common_base = workflow2_common_base(video.stem)
-        else:
-            common_base = video.stem
-
+def process_render_jobs():
+    tasks = []
+    for v in iter_video_files():
+        base = workflow2_common_base(v.stem) if Ctx.naming == "workflow2" else v.stem
         for lang in Ctx.dest_langs:
-            candidates: List[Path] = []
-            if Ctx.naming == "workflow2":
-                for srt in iter_subtitle_files():
-                    if not srt.name.lower().endswith(f".{lang}.srt"):
-                        continue
-                    if workflow2_common_base(srt.stem).lower() == common_base.lower():
-                        candidates.append(srt)
-            else:
-                p = Ctx.subtitle_dir / f"{common_base}.{lang}.srt"
-                if p.exists():
-                    candidates.append(p)
-            if not candidates:
-                continue
-            tasks.append((video, candidates[0], lang, common_base))
-
-    if not tasks:
-        return 0
-
-    # Параллельный режим: если задач > 1 и есть несколько GPU
+            cands = [s for s in iter_subtitle_files() if s.name.lower().endswith(f".{lang}.srt") and workflow2_common_base(s.stem).lower() == base.lower()] if Ctx.naming == "workflow2" else ([Ctx.subtitle_dir / f"{base}.{lang}.srt"] if (Ctx.subtitle_dir / f"{base}.{lang}.srt").exists() else [])
+            if cands: tasks.append((v, cands[0], lang, base))
+    if not tasks: return 0
     parallel = max(1, int(os.environ.get("RENDER_PARALLEL", "1")))
-    if parallel <= 1:
-        started = 0
-        for video, sub, lang, base in tasks:
-            try:
-                if render_one(video, sub, lang, output_base=base):
-                    started += 1
-            except Exception as e:
-                write_log(f"RENDER ERROR {video.name} [{lang}] -> {e}")
-        return started
-
-    # Параллельно
+    if parallel == 1:
+        return sum(render_one(v, s, l, output_base=b) for v, s, l, b in tasks)
     import threading as _th
-    write_log(f"RENDER parallel mode: {parallel} workers")
-    started_counter = [0]
-    counter_lock = _th.Lock()
-    task_lock = _th.Lock()
-    task_iter = iter(enumerate(tasks))
-
-    def worker(gpu_idx: int):
+    counter = [0]
+    lock = _th.Lock()
+    it = iter(enumerate(tasks))
+    def worker(gpu):
+        nonlocal it
         while True:
-            with task_lock:
-                try:
-                    task_no, (video, sub, lang, base) = next(task_iter)
-                except StopIteration:
-                    return
-            try:
-                if render_one(video, sub, lang, output_base=base, gpu_index=gpu_idx):
-                    with counter_lock:
-                        started_counter[0] += 1
-            except Exception as e:
-                write_log(f"RENDER ERROR {video.name} [{lang}] (gpu={gpu_idx}) -> {e}")
+            with lock:
+                try: _, (v, s, l, b) = next(it)
+                except StopIteration: return
+            if render_one(v, s, l, output_base=b, gpu_index=gpu):
+                with lock: counter[0] += 1
+    threads = [_th.Thread(target=worker, args=(i,), daemon=True) for i in range(parallel)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    return counter[0]
 
-    threads = []
-    for i in range(parallel):
-        t = _th.Thread(target=worker, args=(i,), name=f"render-gpu{i}", daemon=True)
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join()
-    return started_counter[0]
+def process_translation_jobs():
+    return sum(process_raw_subtitle(s) for s in iter_subtitle_files() if is_raw_subtitle_source(s))
 
+def validate_paths():
+    for p in [Ctx.video_dir, Ctx.subtitle_dir, Ctx.logo_dir, Ctx.output_dir, Ctx.log_dir]:
+        p.mkdir(parents=True, exist_ok=True)
 
-def process_translation_jobs() -> int:
-    started = 0
-    for subtitle in iter_subtitle_files():
-        if not is_raw_subtitle_source(subtitle):
-            continue
-        try:
-            started += process_raw_subtitle(subtitle)
-        except Exception as e:
-            write_log(f"TRANS ERROR {subtitle.name} -> {e}")
-    return started
-
-
-# =========================================================
-# СТАРТ
-# =========================================================
-def validate_paths() -> None:
-    if not Ctx.video_dir.exists():
-        write_log(f"WARN VideoDir not found, creating: {Ctx.video_dir}")
-        Ctx.video_dir.mkdir(parents=True, exist_ok=True)
-    if not Ctx.subtitle_dir.exists():
-        write_log(f"WARN SubtitleDir not found, creating: {Ctx.subtitle_dir}")
-        Ctx.subtitle_dir.mkdir(parents=True, exist_ok=True)
-    Ctx.output_dir.mkdir(parents=True, exist_ok=True)
-    Ctx.log_dir.mkdir(parents=True, exist_ok=True)
-    Ctx.logo_dir.mkdir(parents=True, exist_ok=True)
-    get_state_dir(Ctx.output_dir)
-    get_state_dir(Ctx.subtitle_dir)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="AutoTranslate + HardSub (Kaggle edition)")
-    parser.add_argument("--once", action="store_true", help="Один проход (для Kaggle — рекомендуется)")
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--once", action="store_true")
     parser.add_argument("--video-dir", default=str(DEFAULT_VIDEO_DIR))
     parser.add_argument("--subtitle-dir", default=str(DEFAULT_SUBTITLE_DIR))
     parser.add_argument("--logo-dir", default=str(DEFAULT_LOGO_DIR))
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))
-    parser.add_argument("--src-lang", default=os.environ.get("SRC_LANG", "tr"))
-    parser.add_argument("--dest-langs", default=os.environ.get("DEST_LANGS", "en,it,es"),
-                        help="Через запятую: en,it,es")
-    parser.add_argument("--encoder", choices=["nvenc", "libx264", "auto"],
-                        default=os.environ.get("ENCODER", "auto"))
-    parser.add_argument("--skip-translation", action="store_true",
-                        help="Только хардсаб, не делать перевод")
-    parser.add_argument("--skip-render", action="store_true",
-                        help="Только перевод, не делать хардсаб")
-    parser.add_argument("--naming", choices=["stem", "workflow2"],
-                        default=os.environ.get("NAMING", "stem"),
-                        help="stem: video.mp4 + video.<lang>.srt (по умолчанию). "
-                             "workflow2: <base>_video.mp4 + <base>_audio.<lang>.srt")
+    parser.add_argument("--src-lang", default="tr")
+    parser.add_argument("--dest-langs", default="en,it,es")
+    parser.add_argument("--encoder", default="auto")
+    parser.add_argument("--skip-translation", action="store_true")
+    parser.add_argument("--skip-render", action="store_true")
+    parser.add_argument("--naming", default="stem")
     args = parser.parse_args()
 
-    # настраиваем Ctx
     Ctx.video_dir = Path(args.video_dir)
     Ctx.subtitle_dir = Path(args.subtitle_dir)
     Ctx.logo_dir = Path(args.logo_dir)
@@ -1105,41 +508,15 @@ def main() -> None:
     Ctx.skip_translation = args.skip_translation
     Ctx.naming = args.naming
 
-    configure_stdio()
+    download_logos()
     ensure_commands_exist()
     validate_paths()
-
     Ctx.encoder = detect_encoder(args.encoder)
-    write_log(f"Kaggle pipeline started")
-    write_log(f"  VideoDir    = {Ctx.video_dir}")
-    write_log(f"  SubtitleDir = {Ctx.subtitle_dir}")
-    write_log(f"  LogoDir     = {Ctx.logo_dir}")
-    write_log(f"  OutputDir   = {Ctx.output_dir}")
-    write_log(f"  LogDir      = {Ctx.log_dir}")
-    write_log(f"  src={Ctx.src_lang}  dest={Ctx.dest_langs}  encoder={Ctx.encoder}  naming={Ctx.naming}")
-    update_heartbeat()
 
-    videos = iter_video_files()
-    subtitles = iter_subtitle_files()
-    write_log(f"SCAN: videos={len(videos)} subtitles={len(subtitles)}")
-
-    trans_started = 0
-    if not Ctx.skip_translation:
-        trans_started = process_translation_jobs()
-    else:
-        write_log("Translation skipped by flag")
-
-    render_started = 0
-    if not args.skip_render:
-        render_started = process_render_jobs()
-    else:
-        write_log("Render skipped by flag")
-
-    if trans_started == 0 and render_started == 0:
-        write_log("IDLE: nothing to do")
-
-    write_log("Pipeline finished")
-
+    write_log("=== Colab HardSub started ===")
+    if not Ctx.skip_translation: process_translation_jobs()
+    if not args.skip_render: process_render_jobs()
+    write_log("=== Colab HardSub finished ===")
 
 if __name__ == "__main__":
     main()
