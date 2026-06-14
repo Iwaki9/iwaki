@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import pysrt
-import psutil  # Добавлено для мониторинга CPU
+import psutil
 
 COLAB_WORKING = Path(os.environ.get("COLAB_WORKING_DIR", "/content"))
 
@@ -31,11 +31,6 @@ NLLB_LANG_MAP = {
     "tr": "tur_Latn", "en": "eng_Latn", "it": "ita_Latn", "es": "spa_Latn",
     "ru": "rus_Cyrl", "fr": "fra_Latn", "de": "deu_Latn", "pt": "por_Latn",
 }
-
-DEFAULT_NLLB_MODEL = os.environ.get("NLLB_MODEL", "facebook/nllb-200-distilled-600M")
-TRANSLATE_BATCH_SIZE = int(os.environ.get("TRANSLATE_BATCH_SIZE", "16"))
-TRANSLATE_MAX_LENGTH = int(os.environ.get("TRANSLATE_MAX_LENGTH", "512"))
-CHECKPOINT_EVERY = 50
 
 NVENC_PRESET = "p1"
 VIDEO_BITRATE = "2000k"
@@ -63,7 +58,6 @@ class Ctx:
     log_path: Path; heartbeat_path: Path; src_lang: str; dest_langs: List[str]
     encoder: str; skip_translation: bool; naming: str
 
-# Фоновый монитор ресурсов процессора и видеокарты
 import threading as _threading_mon
 _GPU_MON_LOCK = _threading_mon.Lock()
 _GPU_MON_REFCOUNT = 0
@@ -76,20 +70,16 @@ def _gpu_monitor_loop(stop_event, interval: float) -> None:
             cpu_util = psutil.cpu_percent()
             ram_util = psutil.virtual_memory().percent
             gpu_str = "No GPU Info"
-            
             if shutil.which("nvidia-smi"):
                 r = subprocess.run(["nvidia-smi", "--query-gpu=index,utilization.gpu,utilization.encoder,utilization.decoder,memory.used", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5)
                 if r.returncode == 0 and r.stdout.strip():
                     parts = []
                     for line in r.stdout.strip().splitlines():
                         cols = [x.strip() for x in line.split(",")]
-                        if len(cols) >= 5:
-                            parts.append(f"GPU{cols[0]}: util={cols[1]}% NVENC={cols[2]}% vram={cols[4]}MB")
+                        if len(cols) >= 5: parts.append(f"GPU{cols[0]}: util={cols[1]}% NVENC={cols[2]}% vram={cols[4]}MB")
                     gpu_str = " | ".join(parts)
-            
-            write_log(f"📊 SYSTEM LOAD -> CPU: {cpu_util}% | RAM: {ram_util}% | {gpu_str}")
-        except Exception as _e: 
-            write_log(f"Resource monitor warn: {_e}")
+            write_log(f"📊 SYSTEM -> CPU: {cpu_util}% | RAM: {ram_util}% | {gpu_str}")
+        except Exception as _e: pass
 
 def gpu_monitor_acquire() -> None:
     global _GPU_MON_REFCOUNT, _GPU_MON_STOP, _GPU_MON_THREAD
@@ -201,8 +191,6 @@ def render_one(video: Path, subtitle: Path, lang: str, output_base: Optional[str
     temp_sub = new_temp_subtitle_copy(subtitle)
     escaped_sub = escape_subtitle_path_for_filter(temp_sub)
 
-    # Внимание: для предотвращения падения скорости из-за постоянного переброса текстур
-    # GPU <-> CPU при обработке libass, hwaccel на декодинг выключен намеренно.
     inputs = ["-i", str(video)]
     if logo: inputs += ["-i", str(logo)]
 
@@ -229,7 +217,6 @@ def render_one(video: Path, subtitle: Path, lang: str, output_base: Optional[str
         venc_args = ["-c:v", "h264_nvenc", "-preset", NVENC_PRESET, "-b:v", VIDEO_BITRATE, "-maxrate", MAXRATE, "-bufsize", BUFSIZE] if Ctx.encoder == "nvenc" else ["-c:v", "libx264", "-preset", "veryfast", "-b:v", VIDEO_BITRATE, "-pix_fmt", "yuv420p"]
         threads_env = os.environ.get("FFMPEG_THREADS", "0")
 
-        # Перехват прогресса через pipe:1
         args = [FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "quiet", "-progress", "pipe:1", "-threads", threads_env, *inputs, "-filter_complex", filter_complex, "-map", "[v]", "-map", "0:a?", *venc_args]
         args += ["-c:a", "copy"] if USE_AUDIO_COPY else ["-c:a", "aac", "-b:a", "128k"]
         args.append(str(output_path))
@@ -237,7 +224,6 @@ def render_one(video: Path, subtitle: Path, lang: str, output_base: Optional[str
         gpu_monitor_acquire()
         try: 
             proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", env=ffmpeg_env)
-            
             frame, fps, speed = "0", "0", "0x"
             last_print_time = 0
             
@@ -251,7 +237,6 @@ def render_one(video: Path, subtitle: Path, lang: str, output_base: Optional[str
                 elif line.startswith("progress="):
                     if line.split("=")[1].strip() == "end": break
                     now = time.time()
-                    # Задержка вывода статуса 5 секунд, чтобы параллельные воркеры не мешали друг другу
                     if now - last_print_time >= 5:
                         print(f"⏳ [{lang.upper()}] Frame: {frame} | FPS: {fps} | Speed: {speed}", flush=True)
                         last_print_time = now
