@@ -282,7 +282,6 @@ def _sftp_upload(files: Sequence[Path], host, user, port, path, password):
 def _api_upload(fpath: Path, server, hostings, token, speed_limit_mbps=2, speed_time_sec=120, max_retries=3):
     size_mb = fpath.stat().st_size / 1024 / 1024
     speed_limit_bps = int(speed_limit_mbps * 1024 * 1024 / 8) if speed_limit_mbps > 0 else 0
-    last = ''
     for attempt in range(1, max_retries + 1):
         t0 = time.time()
         args = ['curl', '-sS', '--fail-with-body', '-X', 'POST', '--connect-timeout', '30', '-H', f'X-API-Key: {token}', '-F', f'files=@{fpath}']
@@ -296,9 +295,8 @@ def _api_upload(fpath: Path, server, hostings, token, speed_limit_mbps=2, speed_
         speed = (size_mb * 8) / dt if dt > 0 else 0
 
         if r.returncode == 0: return True, f'{speed:.1f} Mbps'
-        last = f'exit {r.returncode}'
         time.sleep(5)
-    return False, last
+    return False, 'failed'
 
 def list_outputs(langs: Union[str, Iterable[str], None] = None) -> List[Path]:
     files = sorted(p for p in OUT_DIR.glob('*.mp4') if p.is_file())
@@ -325,7 +323,7 @@ def _upload(files: Sequence[Path], targets: Sequence[str], **kw):
 
     if 'api' in targets:
         token = sec.get_secret('UPLOAD_API_TOKEN')
-        for i, f in enumerate(files, 1):
+        for f in files:
             ok, info = _api_upload(f, p['api_server'], p['api_hostings'], token, p['api_speed_limit_mbps'], p['api_speed_time_sec'], p['api_max_retries'])
             if ok: res['api_ok'] += 1
             else: res['api_fail'].append((f.name, info))
@@ -372,7 +370,6 @@ def run(*, folder: Optional[str] = None, folder_id: Optional[str] = None, langs:
     print('=== 1/4 Скачивание папки из Google Drive ===')
     print('📥 Загрузка запущена (тихий режим, без спама строками)...')
     import gdown
-    # Индикатор отключен ради предотвращения лавинного спама строками в Colab
     gdown.download_folder(id=real_folder_id, output=str(SRC_DIR), quiet=True, use_cookies=False)
     print('✅ Скачивание успешно завершено!')
 
@@ -384,8 +381,8 @@ def run(*, folder: Optional[str] = None, folder_id: Optional[str] = None, langs:
 
     print('\n=== 2/4 Запуск рендера хардсаба ===')
     t_render = time.time()
-    # Флаг '-u' принудительно отключает буферизацию вывода Python!
-    rc = subprocess.call([
+    
+    cmd = [
         'python', '-u', str(script), '--once',
         '--video-dir',    str(VIDEO_DIR),
         '--subtitle-dir', str(SUBS_DIR),
@@ -396,8 +393,22 @@ def run(*, folder: Optional[str] = None, folder_id: Optional[str] = None, langs:
         '--encoder',      profile['encoder'],
         '--naming',       profile['naming'],
         '--skip-translation',
-    ])
-    if rc != 0: tg_send('❌ Colab: рендер завершился ошибкой'); raise RuntimeError('Рендер упал')
+    ]
+
+    # Использование Popen с stdout=PIPE позволяет Colab захватывать вывод напрямую в sys.stdout
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    
+    while True:
+        line = proc.stdout.readline()
+        if not line:
+            break
+        print(line, end='', flush=True)  # Логи стримятся прямо в ячейку в реальном времени!
+
+    proc.wait()
+    rc = proc.returncode
+    if rc != 0: 
+        tg_send('❌ Colab: рендер завершился ошибкой')
+        raise RuntimeError('Рендер упал')
     
     outputs = list_outputs()
     tg_send(f'✅ Рендер готов за {(time.time()-t_render)/60:.1f} мин', silent=True)
