@@ -1,9 +1,12 @@
 # colab_pipeline.py
 from __future__ import annotations
 import os
+import re
 import shutil
 import subprocess
+import urllib.request
 from pathlib import Path
+from typing import Optional
 
 WORKING   = Path('/content')
 SRC_DIR   = WORKING / 'src'
@@ -50,27 +53,62 @@ def setup():
     print("=== SETUP (Colab) ===")
     ensure_dirs()
     download_logos()
-
-    # === Улучшенная установка ffmpeg ===
     if not FFMPEG_BIN.exists():
-        print("Устанавливаем ffmpeg с NVENC (может занять 1-2 минуты)...")
+        print("Устанавливаем ffmpeg...")
         try:
             subprocess.run(['bash', '-c', '''
                 rm -rf /content/ffmpeg-bin /tmp/ffmpeg.tar.xz
-                wget -q --show-progress https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-n8.1.tar.xz -O /tmp/ffmpeg.tar.xz
+                wget -q https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-n8.1.tar.xz -O /tmp/ffmpeg.tar.xz
                 tar -xf /tmp/ffmpeg.tar.xz -C /content
                 mv /content/ffmpeg-n8.1* /content/ffmpeg-bin 2>/dev/null || true
             '''], check=True, timeout=300)
-            print("✅ ffmpeg с NVENC установлен")
-        except Exception as e:
-            print(f"⚠️ Не удалось установить BtbN ffmpeg: {e}")
-            print("Будет использован системный ffmpeg (/usr/bin/ffmpeg)")
+        except:
+            print("⚠️ Используем системный ffmpeg")
             os.makedirs('/content/ffmpeg-bin/bin', exist_ok=True)
             subprocess.run(['ln', '-sf', '/usr/bin/ffmpeg', '/content/ffmpeg-bin/bin/ffmpeg'], check=False)
-            subprocess.run(['ln', '-sf', '/usr/bin/ffprobe', '/content/ffmpeg-bin/bin/ffprobe'], check=False)
-
-    subprocess.run(['pip', 'install', '-q', 'gdown', 'pysrt', 'transformers', 'sentencepiece', 'accelerate'], check=True)
+    subprocess.run(['pip', 'install', '-q', 'gdown'], check=True)
     print("✅ SETUP завершён")
+
+
+def _resolve_drive_folder(folder: str, parent_id: Optional[str]) -> str:
+    """Ищет ID подпапки по имени внутри родительской папки (работает для публичных папок)."""
+    if folder.startswith('http'):
+        return folder
+    if len(folder) >= 20 and '/' not in folder:
+        return folder
+
+    if not parent_id:
+        raise RuntimeError("drive_parent_id не задан")
+
+    url = f"https://drive.google.com/drive/folders/{parent_id}"
+    print(f"🔍 Ищу подпапку '{folder}' в родительской папке...")
+
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            html = r.read().decode('utf-8', errors='replace')
+    except Exception as e:
+        raise RuntimeError(f"Не удалось загрузить страницу Drive: {e}")
+
+    items = {}
+    for m in re.finditer(r'data-id="([0-9A-Za-z_-]{20,})"', html):
+        item_id = m.group(1)
+        # Простой поиск имени рядом
+        start = max(0, m.start() - 300)
+        end = min(len(html), m.end() + 300)
+        block = html[start:end]
+        name_match = re.search(r'aria-label="([^"]+)"', block) or re.search(r'data-tooltip="([^"]+)"', block)
+        if name_match:
+            name = name_match.group(1).split(',')[0].strip()
+            items[name] = item_id
+
+    if folder in items:
+        sub_id = items[folder]
+        print(f"✅ Найдена подпапка '{folder}': {sub_id}")
+        return sub_id
+
+    raise RuntimeError(f"Подпапка '{folder}' не найдена. Доступные: {list(items.keys())[:10]}")
+
 
 def run(*, folder: str, langs: str = 'en', upload: str = 'api', **overrides):
     profile = {**DEFAULTS, **overrides}
@@ -82,8 +120,11 @@ def run(*, folder: str, langs: str = 'en', upload: str = 'api', **overrides):
         p.mkdir(parents=True, exist_ok=True)
 
     import gdown
-    print(f"=== Скачивание папки {folder} ===")
-    gdown.download_folder(id=folder, output=str(SRC_DIR), quiet=False)
+
+    real_id = _resolve_drive_folder(folder, profile.get('drive_parent_id'))
+
+    print(f"=== Скачивание подпапки {folder} (ID: {real_id}) ===")
+    gdown.download_folder(id=real_id, output=str(SRC_DIR), quiet=False, use_cookies=False)
 
     for f in SRC_DIR.rglob('*'):
         if f.is_file():
@@ -108,6 +149,7 @@ def run(*, folder: str, langs: str = 'en', upload: str = 'api', **overrides):
         raise RuntimeError(f"Хардсаб завершился с ошибкой: {rc}")
 
     print(f"Готово файлов: {len(list(OUT_DIR.glob('*.mp4')))}")
+
 
 def stop():
     import os
