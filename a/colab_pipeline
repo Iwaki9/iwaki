@@ -97,6 +97,121 @@ def parse_subtitle_lang(filename: str) -> Optional[str]:
     return None
 
 # =========================================================
+# СИСТЕМНЫЕ ФУНКЦИИ И СЕНДЕР TELEGRAM
+# =========================================================
+def _ensure_dirs():
+    for p in (SRC_DIR, VIDEO_DIR, SUBS_DIR, OUT_DIR, LOG_DIR, Path(LOGO_DIR_DEFAULT)):
+        p.mkdir(parents=True, exist_ok=True)
+
+def _ensure_script(logo_dir: str) -> Path:
+    dst = WORKING / SCRIPT_NAME
+    src = Path(logo_dir) / SCRIPT_NAME
+    if not dst.exists():
+        if not src.exists():
+            raise RuntimeError(f'{SCRIPT_NAME} не найден.')
+        shutil.copy2(src, dst)
+    return dst
+
+def _set_env(profile: dict):
+    os.environ['PATH'] = f'{FFMPEG_BIN.parent}:' + os.environ.get('PATH', '')
+    os.environ['FFMPEG_PATH']     = str(FFMPEG_BIN)
+    os.environ['FFPROBE_PATH']    = str(FFPROBE_BIN)
+
+    threads = profile.get('ffmpeg_threads', 'auto')
+    parallel = int(profile.get('render_parallel', 1))
+    os.environ['FFMPEG_THREADS']  = str(2 if threads == 'auto' else threads)
+    os.environ['RENDER_PARALLEL'] = str(parallel)
+    os.environ['USE_GPU_OVERLAY'] = '1' if profile.get('gpu_overlay') else '0'
+
+    ldir = profile['logo_dir']
+    os.environ['LOGO_EN'] = profile['logo_en'] or f'{ldir}/logo riki.png'
+    os.environ['LOGO_IT'] = profile['logo_it'] or f'{ldir}/logo.png'
+    os.environ['LOGO_ES'] = profile['logo_es'] or f'{ldir}/logo.png'
+
+def tg_send(text: str, silent: bool = False):
+    sec = _secrets()
+    if sec is None: return
+    token = sec.get_secret('TG_BOT_TOKEN')
+    chat  = sec.get_secret('TG_CHAT_ID')
+    if not token or not chat: return
+    try:
+        import requests
+        requests.post(f'https://api.telegram.org/bot{token}/sendMessage', data={'chat_id': chat, 'text': text, 'parse_mode': 'HTML', 'disable_notification': silent}, timeout=15)
+    except Exception: pass
+
+# =========================================================
+# УДАЛЕННЫЙ МЕНЕДЖЕР КООРДИНАЦИИ КЛАСТЕРА (Безопасный Heredoc)
+# =========================================================
+def _get_remote_states(p: dict, password: str) -> set[str]:
+    env = os.environ.copy()
+    env.update(SFTP_PASS=password)
+    bdir = f"{p['sftp_path']}/.blacklist"
+    cmd = f'''lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" <<EOF
+    mkdir -p "{bdir}"
+    cls -1 "{bdir}"
+    quit
+EOF'''
+    r = subprocess.run(['bash', '-c', cmd], capture_output=True, text=True, env=env)
+    return {line.strip() for line in r.stdout.splitlines() if line.strip()} if r.returncode == 0 else set()
+
+def _add_lock_marker(p: dict, password: str, marker_name: str):
+    env = os.environ.copy()
+    env.update(SFTP_PASS=password)
+    bdir = f"{p['sftp_path']}/.blacklist"
+    tmp_f = Path(f"/tmp/lock_node.tmp")
+    tmp_f.touch()
+    cmd = f'''lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" <<EOF
+    mkdir -p "{bdir}"
+    put "{tmp_f}" -o "{bdir}/{marker_name}.lock"
+    quit
+EOF'''
+    subprocess.run(['bash', '-c', cmd], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    tmp_f.unlink(missing_ok=True)
+
+def _convert_lock_to_done(p: dict, password: str, marker_name: str):
+    env = os.environ.copy()
+    env.update(SFTP_PASS=password)
+    bdir = f"{p['sftp_path']}/.blacklist"
+    tmp_done = Path(f"/tmp/done_node.tmp")
+    tmp_done.touch()
+    cmd = f'''lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" <<EOF
+    mkdir -p "{bdir}"
+    rm -f "{bdir}/{marker_name}.lock"
+    put "{tmp_done}" -o "{bdir}/{marker_name}.done"
+    quit
+EOF'''
+    subprocess.run(['bash', '-c', cmd], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    tmp_done.unlink(missing_ok=True)
+
+def _remove_lock_marker(p: dict, password: str, marker_name: str):
+    env = os.environ.copy()
+    env.update(SFTP_PASS=password)
+    bdir = f"{p['sftp_path']}/.blacklist"
+    cmd = f'''lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" <<EOF
+    rm -f "{bdir}/{marker_name}.lock"
+    quit
+EOF'''
+    subprocess.run(['bash', '-c', cmd], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def clear_all_locks():
+    sec = _secrets()
+    sftp_pw = sec.get_secret('SFTP_PASS') if sec else None
+    if not sftp_pw:
+        print("❌ Секрет SFTP_PASS не найден."); return
+    p = {**DEFAULTS}
+    env = os.environ.copy()
+    env.update(SFTP_PASS=sftp_pw)
+    bdir = f"{p['sftp_path']}/.blacklist"
+    print(f"🧹 Стираю аварийные блокировки (.lock) в {bdir}...")
+    cmd = f'''lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" <<EOF
+    cd "{bdir}"
+    rm -f *.lock
+    quit
+EOF'''
+    subprocess.run(['bash', '-c', cmd], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print("✅ Очередь бронирования успешно очищена.")
+
+# =========================================================
 # ПОДДЕРЖКА YOUTUBE PO-TOKEN ДЛЯ ОБХОДА БАНОВ
 # =========================================================
 def setup_pot_provider() -> bool:
@@ -127,36 +242,51 @@ def setup_pot_provider() -> bool:
     return False
 
 # =========================================================
-# СИСТЕМНЫЙ СЕТАП ОКРУЖЕНИЯ
+# YT-DLP ДВИЖОК СКАЧИВАНИЯ (H.264 HD 1080p/720p)
 # =========================================================
-def _ensure_dirs():
-    for p in (SRC_DIR, VIDEO_DIR, SUBS_DIR, OUT_DIR, LOG_DIR, Path(LOGO_DIR_DEFAULT)):
-        p.mkdir(parents=True, exist_ok=True)
+def _ytdlp_extract_with_fallback(url: str, cookies: Optional[str], flat: bool) -> Optional[dict]:
+    from yt_dlp import YoutubeDL
+    for clients in YTDLP_CLIENT_VARIANTS:
+        opts = {'quiet': True, 'no_warnings': True, 'skip_download': True, 'extract_flat': 'in_playlist' if flat else False}
+        if clients: opts['extractor_args'] = {'youtube': {'player_client': clients}}
+        if cookies and Path(cookies).exists(): opts['cookiefile'] = cookies
+        try:
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if info: return info
+            if _POT_PROVIDER_AVAILABLE:
+                opts['extractor_args'] = {'youtube': {'player_client': ['default', 'mweb']}}
+                with YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    if info: return info
+        except Exception: continue
+    return None
 
-def _ensure_script(logo_dir: str) -> Path:
-    dst = WORKING / SCRIPT_NAME
-    src = Path(logo_dir) / SCRIPT_NAME
-    if not dst.exists():
-        if not src.exists():
-            raise RuntimeError(f'{SCRIPT_NAME} не найден.')
-        shutil.copy2(src, dst)
-    return dst
+def download_youtube_video(url: str, output_dir: Path, cookies: Optional[str] = None, max_height: int = 1080) -> Optional[Path]:
+    from yt_dlp import YoutubeDL
+    info = _ytdlp_extract_with_fallback(url, cookies, flat=False)
+    if not info: return None
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_tmpl = str(output_dir / '%(id)s.%(ext)s')
+    fmt = f'bestvideo[ext=mp4][vcodec^=avc1][height<={max_height}]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1][height<={max_height}]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+    opts = {'format': fmt, 'outtmpl': out_tmpl, 'quiet': True, 'no_warnings': True, 'merge_output_format': 'mp4'}
+    try:
+        with YoutubeDL(opts) as ydl:
+            info_download = ydl.extract_info(url, download=True)
+            for f in output_dir.iterdir():
+                if f.stem == info_download['id']: return f
+    except Exception: pass
+    return None
 
-def _set_env(profile: dict):
-    os.environ['PATH'] = f'{FFMPEG_BIN.parent}:' + os.environ.get('PATH', '')
-    os.environ['FFMPEG_PATH']     = str(FFMPEG_BIN)
-    os.environ['FFPROBE_PATH']    = str(FFPROBE_BIN)
-
-    threads = profile.get('ffmpeg_threads', 'auto')
-    parallel = int(profile.get('render_parallel', 1))
-    os.environ['FFMPEG_THREADS']  = str(2 if threads == 'auto' else threads)
-    os.environ['RENDER_PARALLEL'] = str(parallel)
-    os.environ['USE_GPU_OVERLAY'] = '1' if profile.get('gpu_overlay') else '0'
-
-    ldir = profile['logo_dir']
-    os.environ['LOGO_EN'] = profile['logo_en'] or f'{ldir}/logo riki.png'
-    os.environ['LOGO_IT'] = profile['logo_it'] or f'{ldir}/logo.png'
-    os.environ['LOGO_ES'] = profile['logo_es'] or f'{ldir}/logo.png'
+def _api_upload(fpath: Path, server, hostings, token, speed_limit_mbps=2, speed_time_sec=120, max_retries=3):
+    for attempt in range(1, max_retries + 1):
+        args = ['curl', '-sS', '--fail-with-body', '-X', 'POST', '--connect-timeout', '30', '-H', f'X-API-Key: {token}', '-F', f'files=@{fpath}']
+        for h in hostings: args += ['-F', f'hostings={h}']
+        args += [f'{server}/api/upload']
+        r = subprocess.run(args, capture_output=True, text=True, timeout=7200)
+        if r.returncode == 0: return True
+        time.sleep(5)
+    return False
 
 SETUP_SCRIPT = r'''
 set -e
@@ -208,127 +338,6 @@ def setup():
     rc = subprocess.call(['bash', '-c', SETUP_SCRIPT])
     if rc != 0: raise RuntimeError(f'setup failed, exit={rc}')
 
-def _secrets():
-    try:
-        from google.colab import userdata
-        class ColabSecretsWrapper:
-            def get_secret(self, name):
-                try: return userdata.get(name)
-                except Exception: return None
-        return ColabSecretsWrapper()
-    except Exception: return None
-
-def tg_send(text: str, silent: bool = False):
-    sec = _secrets()
-    if sec is None: return
-    token = sec.get_secret('TG_BOT_TOKEN')
-    chat  = sec.get_secret('TG_CHAT_ID')
-    if not token or not chat: return
-    try:
-        import requests
-        requests.post(f'https://api.telegram.org/bot{token}/sendMessage', data={'chat_id': chat, 'text': text, 'parse_mode': 'HTML', 'disable_notification': silent}, timeout=15)
-    except Exception: pass
-
-# =========================================================
-# УДАЛЕННЫЙ МЕНЕДЖЕР КООРДИНАЦИИ КЛАСТЕРА (SFTP)
-# =========================================================
-def _get_remote_states(p: dict, password: str) -> set[str]:
-    env = os.environ.copy()
-    env.update(SFTP_PASS=password)
-    bdir = f"{p['sftp_path']}/.blacklist"
-    cmd = f'lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" -e "mkdir -p {bdir}; cls -1 {bdir}; quit"'
-    r = subprocess.run(['bash', '-c', cmd], capture_output=True, text=True, env=env)
-    return {line.strip() for line in r.stdout.splitlines() if line.strip()} if r.returncode == 0 else set()
-
-def _add_lock_marker(p: dict, password: str, marker_name: str):
-    env = os.environ.copy()
-    env.update(SFTP_PASS=password)
-    bdir = f"{p['sftp_path']}/.blacklist"
-    tmp_f = Path(f"/tmp/{marker_name}.lock")
-    tmp_f.touch()
-    cmd = f'lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" -e "put {tmp_f} -o {bdir}/{tmp_f.name}; quit"'
-    subprocess.run(['bash', '-c', cmd], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    tmp_f.unlink(missing_ok=True)
-
-def _convert_lock_to_done(p: dict, password: str, marker_name: str):
-    env = os.environ.copy()
-    env.update(SFTP_PASS=password)
-    bdir = f"{p['sftp_path']}/.blacklist"
-    tmp_done = Path(f"/tmp/{marker_name}.done")
-    tmp_done.touch()
-    cmd = f'lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" -e "rm -f {bdir}/{marker_name}.lock; put {tmp_done} -o {bdir}/{tmp_done.name}; quit"'
-    subprocess.run(['bash', '-c', cmd], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    tmp_done.unlink(missing_ok=True)
-
-def _remove_lock_marker(p: dict, password: str, marker_name: str):
-    env = os.environ.copy()
-    env.update(SFTP_PASS=password)
-    bdir = f"{p['sftp_path']}/.blacklist"
-    cmd = f'lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" -e "rm -f {bdir}/{marker_name}.lock; quit"'
-    subprocess.run(['bash', '-c', cmd], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-def clear_all_locks():
-    """Сброс зависших сессий: удаляет все файлы .lock из координационной папки на SFTP."""
-    sec = _secrets()
-    sftp_pw = sec.get_secret('SFTP_PASS') if sec else None
-    if not sftp_pw:
-        print("❌ Секрет SFTP_PASS не найден."); return
-    p = {**DEFAULTS}
-    env = os.environ.copy()
-    env.update(SFTP_PASS=sftp_pw)
-    bdir = f"{p['sftp_path']}/.blacklist"
-    print(f"🧹 Стираю аварийные блокировки (.lock) в {bdir}...")
-    cmd = f'lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" -e "cd {bdir}; rm -f *.lock; quit"'
-    subprocess.run(['bash', '-c', cmd], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print("✅ Очередь бронирования успешно очищена.")
-
-# =========================================================
-# YT-DLP ДВИЖОК СКАЧИВАНИЯ (H.264 HD 1080p/720p)
-# =========================================================
-def _ytdlp_extract_with_fallback(url: str, cookies: Optional[str], flat: bool) -> Optional[dict]:
-    from yt_dlp import YoutubeDL
-    for clients in YTDLP_CLIENT_VARIANTS:
-        opts = {'quiet': True, 'no_warnings': True, 'skip_download': True, 'extract_flat': 'in_playlist' if flat else False}
-        if clients: opts['extractor_args'] = {'youtube': {'player_client': clients}}
-        if cookies and Path(cookies).exists(): opts['cookiefile'] = cookies
-        try:
-            with YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                if info: return info
-            if _POT_PROVIDER_AVAILABLE:
-                opts['extractor_args'] = {'youtube': {'player_client': ['default', 'mweb']}}
-                with YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    if info: return info
-        except Exception: continue
-    return None
-
-def download_youtube_video(url: str, output_dir: Path, cookies: Optional[str] = None, max_height: int = 1080) -> Optional[Path]:
-    from yt_dlp import YoutubeDL
-    info = _ytdlp_extract_with_fallback(url, cookies, flat=False)
-    if not info: return None
-    output_dir.mkdir(parents=True, exist_ok=True)
-    out_tmpl = str(output_dir / '%(id)s.%(ext)s')
-    fmt = f'bestvideo[ext=mp4][vcodec^=avc1][height<={max_height}]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1][height<={max_height}]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-    opts = {'format': fmt, 'outtmpl': out_tmpl, 'quiet': True, 'no_warnings': True, 'merge_output_format': 'mp4'}
-    try:
-        with YoutubeDL(opts) as ydl:
-            info_download = ydl.extract_info(url, download=True)
-            for f in output_dir.iterdir():
-                if f.stem == info_download['id']: return f
-    except Exception: pass
-    return None
-
-def _api_upload(fpath: Path, server, hostings, token, speed_limit_mbps=2, speed_time_sec=120, max_retries=3):
-    for attempt in range(1, max_retries + 1):
-        args = ['curl', '-sS', '--fail-with-body', '-X', 'POST', '--connect-timeout', '30', '-H', f'X-API-Key: {token}', '-F', f'files=@{fpath}']
-        for h in hostings: args += ['-F', f'hostings={h}']
-        args += [f'{server}/api/upload']
-        r = subprocess.run(args, capture_output=True, text=True, timeout=7200)
-        if r.returncode == 0: return True
-        time.sleep(5)
-    return False
-
 # =========================================================
 # ФИНАЛЬНЫЙ АВТОНОМНЫЙ ОЧЕРЕДНОЙ КЛАСТЕР
 # =========================================================
@@ -338,7 +347,7 @@ def run_autonomous_batch(*, mega_link: str, langs: str = 'en', upload: str = 'ap
     setup_pot_provider()
     
     shutil.rmtree(SRC_DIR, ignore_errors=True); SRC_DIR.mkdir(parents=True, exist_ok=True)
-    print("📥 Шаг 1: Скачивание структуры папки MEGA (субтитры и списки серий)...")
+    print("📥 Шаг 1: Скачивание всей метаструктуры папки MEGA (только субтитры)...")
     subprocess.run(['mega-get', mega_link, str(SRC_DIR)], check=True)
     print("✅ Структура Меги успешно скопирована локально.")
 
@@ -350,7 +359,7 @@ def run_autonomous_batch(*, mega_link: str, langs: str = 'en', upload: str = 'ap
 
     yt_cookies = '/content/yt_cookies.txt' if Path('/content/yt_cookies.txt').exists() else None
 
-    # ОПТИМИЗАЦИЯ: Рекурсивный поиск links.txt защищает от любой вложенности папок MEGA
+    # Поиск файлов links.txt рекурсивно по всему дереву каталогов
     links_files = sorted(SRC_DIR.rglob('links.txt'))
     global_pool = []
 
@@ -466,7 +475,7 @@ def run_autonomous_batch(*, mega_link: str, langs: str = 'en', upload: str = 'ap
                     print(f"   ✅ Залит на хостинги: {out_f.name}")
                     _convert_lock_to_done(profile, sftp_pw, out_f.name)
                 else:
-                    print(f"   ❌ Сбой заливки API: {out_f.name}. Освобождаю.")
+                    print(f"   ❌ Сбой заливки API: {out_f.name}. Возврат очереди.")
                     _remove_lock_marker(profile, sftp_pw, out_f.name)
 
         processed_count += 1
