@@ -114,8 +114,11 @@ def _ensure_script(logo_dir: str) -> Path:
 
 def _set_env(profile: dict):
     os.environ['PATH'] = f'{FFMPEG_BIN.parent}:' + os.environ.get('PATH', '')
-    os.environ['FFMPEG_PATH']     = str(FFMPEG_BIN)
-    os.environ['FFPROBE_PATH']    = str(FFPROBE_BIN)
+    os.environ['FFMPEG_PATH'] = str(FFMPEG_BIN)
+    os.environ['FFPROBE_PATH'] = str(FFPROBE_BIN)
+
+    # ИСПРАВЛЕНИЕ ОШИБКИ CUDA: Принудительно указываем путь к библиотекам NVIDIA драйвера в Colab
+    os.environ['LD_LIBRARY_PATH'] = '/usr/lib64-nvidia:' + os.environ.get('LD_LIBRARY_PATH', '')
 
     threads = profile.get('ffmpeg_threads', 'auto')
     parallel = int(profile.get('render_parallel', 1))
@@ -129,7 +132,6 @@ def _set_env(profile: dict):
     os.environ['LOGO_ES'] = profile['logo_es'] or f'{ldir}/logo.png'
 
 def _secrets():
-    """Чтение секретов из панели Google Colab Userdata."""
     try:
         from google.colab import userdata
         class ColabSecretsWrapper:
@@ -137,8 +139,7 @@ def _secrets():
                 try: return userdata.get(name)
                 except Exception: return None
         return ColabSecretsWrapper()
-    except Exception:
-        return None
+    except Exception: return None
 
 def tg_send(text: str, silent: bool = False):
     sec = _secrets()
@@ -152,7 +153,7 @@ def tg_send(text: str, silent: bool = False):
     except Exception: pass
 
 # =========================================================
-# УДАЛЕННЫЙ МЕНЕДЖЕР КООРДИНАЦИИ КЛАСТЕРА (Безопасный Heredoc)
+# УДАЛЕННЫЙ МЕНЕДЖЕР КООРДИНАЦИИ КЛАСТЕРА
 # =========================================================
 def _get_remote_states(p: dict, password: str) -> set[str]:
     env = os.environ.copy()
@@ -281,7 +282,16 @@ def download_youtube_video(url: str, output_dir: Path, cookies: Optional[str] = 
     output_dir.mkdir(parents=True, exist_ok=True)
     out_tmpl = str(output_dir / '%(id)s.%(ext)s')
     fmt = f'bestvideo[ext=mp4][vcodec^=avc1][height<={max_height}]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1][height<={max_height}]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-    opts = {'format': fmt, 'outtmpl': out_tmpl, 'quiet': True, 'no_warnings': True, 'merge_output_format': 'mp4'}
+    
+    # ИСПРАВЛЕНИЕ ОШИБКИ 403: Принудительно очищаем кэш сигнатур утилиты yt-dlp перед каждым вызовом
+    opts = {
+        'format': fmt, 
+        'outtmpl': out_tmpl, 
+        'quiet': True, 
+        'no_warnings': True, 
+        'merge_output_format': 'mp4',
+        'rm_cached_dir': True
+    }
     try:
         with YoutubeDL(opts) as ydl:
             info_download = ydl.extract_info(url, download=True)
