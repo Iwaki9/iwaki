@@ -32,7 +32,7 @@ NLLB_LANG_MAP = {
     "ru": "rus_Cyrl", "fr": "fra_Latn", "de": "deu_Latn", "pt": "por_Latn",
 }
 
-NVENC_PRESET = "p4"  # Оптимальный пресет: глубокое качество без потери FPS
+NVENC_PRESET = "p4"  
 VIDEO_BITRATE = "2000k"
 MAXRATE = "2000k"
 BUFSIZE = "4000k"
