@@ -67,7 +67,7 @@ YTDLP_CLIENT_VARIANTS = [None, ['tv'], ['ios'], ['web'], ['mweb']]
 _POT_PROVIDER_AVAILABLE = False
 
 # =========================================================
-# ВСТРОЕННЫЕ СЛОЖНЫЕ ПАРСЕРЫ СЕРИЙ И ЯЗЫКОВ
+# ПАРСЕРЫ СЕРИЙ И ЯЗЫКОВ
 # =========================================================
 def parse_episode_number(text: str) -> Optional[int]:
     if not text: return None
@@ -97,7 +97,7 @@ def parse_subtitle_lang(filename: str) -> Optional[str]:
     return None
 
 # =========================================================
-# СИСТЕМНЫЕ ФУНКЦИИ И СЕНДЕР TELEGRAM
+# СИСТЕМНЫЕ НАСТРОЙКИ ОКРУЖЕНИЯ
 # =========================================================
 def _ensure_dirs():
     for p in (SRC_DIR, VIDEO_DIR, SUBS_DIR, OUT_DIR, LOG_DIR, Path(LOGO_DIR_DEFAULT)):
@@ -151,7 +151,7 @@ def tg_send(text: str, silent: bool = False):
     except Exception: pass
 
 # =========================================================
-# УДАЛЕННЫЙ МЕНЕДЖЕР КООРДИНАЦИИ КЛАСТЕРА (Безопасный формат)
+# УДАЛЕННЫЙ МЕНЕДЖЕР КООРДИНАЦИИ КЛАСТЕРА (SFTP)
 # =========================================================
 def _get_remote_states(p: dict, password: str) -> set[str]:
     env = os.environ.copy()
@@ -212,7 +212,60 @@ def clear_all_locks():
         print("✅ Очередь бронирования успешно очищена.")
 
 # =========================================================
-# YT-DLP ДВИЖОК СКАЧИВАНИЯ (H.264 HD 1080p/720p)
+# СКРИПТ УСТАНОВКИ СИСТЕМНЫХ БИНАРНИКОВ (0-отступ)
+# =========================================================
+SETUP_SCRIPT = r'''
+set -e
+test_nvenc() {
+  local FFMPEG_BIN="$1"
+  if [ ! -x "$FFMPEG_BIN" ]; then return 1; fi
+  "$FFMPEG_BIN" -hide_banner -loglevel error -y -f lavfi -i nullsrc=s=320x240:d=0.1 -c:v h264_nvenc /tmp/nvenc_test.mp4 2>/tmp/nvenc_err
+  local rc=$?
+  if [ $rc -eq 0 ] && [ -s /tmp/nvenc_test.mp4 ]; then return 0; fi
+  return $rc
+}
+try_btbn() {
+  local TAG="$1"   
+  local URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-${TAG}-latest-linux64-gpl-${TAG#n}.tar.xz"
+  cd /content
+  rm -rf ffmpeg-bin ffmpeg-${TAG}*
+  if wget -q -O ffmpeg.tar.xz "$URL" && [ -s ffmpeg.tar.xz ]; then
+    tar -xf ffmpeg.tar.xz
+    EXTRACTED=$(ls -d ffmpeg-${TAG}*/ 2>/dev/null | head -1 | tr -d '/')
+    if [ -n "$EXTRACTED" ]; then
+      mv "$EXTRACTED" ffmpeg-bin
+      rm -f ffmpeg.tar.xz
+      if test_nvenc /content/ffmpeg-bin/bin/ffmpeg; then return 0; fi
+    fi
+  fi
+  return 1
+}
+FFMPEG_OK=""
+if try_btbn n8.1; then FFMPEG_OK=1; fi
+if [ -z "$FFMPEG_OK" ] && try_btbn n7.1; then FFMPEG_OK=1; fi
+
+if ! command -v mega-get >/dev/null; then
+  echo '>>> Установка официального консольного клиента MEGA-CMD...'
+  wget -q https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb
+  apt-get update -qq && apt-get install -y -qq "$PWD/megacmd-xUbuntu_22.04_amd64.deb" >/dev/null 2>&1 || true
+  rm -f megacmd-xUbuntu_22.04_amd64.deb
+fi
+
+mkdir -p /content/assets
+wget -q -O "/content/assets/logo riki.png" "https://raw.githubusercontent.com/Iwaki9/iwaki/refs/heads/master/a/logo%20riki.png"
+wget -q -O "/content/assets/logo.png" "https://raw.githubusercontent.com/Iwaki9/iwaki/refs/heads/master/a/logo.png"
+pip install -q pysrt transformers sentencepiece accelerate requests psutil yt-dlp 2>&1 | tail -1
+if ! command -v lftp >/dev/null; then apt-get update -qq && apt-get install -y -qq lftp 2>&1 | tail -1; fi
+echo '>>> SETUP DONE'
+'''
+
+def setup():
+    print('=== SETUP ===')
+    rc = subprocess.call(['bash', '-c', SETUP_SCRIPT])
+    if rc != 0: raise RuntimeError(f'setup failed, exit={rc}')
+
+# =========================================================
+# YT-DLP ДВИЖОК СКАЧИВАНИЯ
 # =========================================================
 def _ytdlp_extract_with_fallback(url: str, cookies: Optional[str], flat: bool) -> Optional[dict]:
     from yt_dlp import YoutubeDL
@@ -266,6 +319,33 @@ def _api_upload(fpath: Path, server, hostings, token, speed_limit_mbps=2, speed_
         time.sleep(5)
     return False
 
+def setup_pot_provider() -> bool:
+    global _POT_PROVIDER_AVAILABLE
+    if _POT_PROVIDER_AVAILABLE: return True
+    print('🔑 Настройка YouTube PO-token сервера in Colab...')
+    try:
+        subprocess.run(['pip', 'install', '-q', '-U', 'bgutil-ytdlp-pot-provider', 'yt-dlp[default]'], check=True)
+        repo_dir = '/content/bgutil-pot'
+        if not Path(repo_dir).exists():
+            subprocess.run(['git', 'clone', '-q', '--depth', '1', 'https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git', repo_dir], check=True)
+        s_dir = f'{repo_dir}/server'
+        if not Path(f'{s_dir}/build').exists():
+            subprocess.run(['npm', 'install', '--silent'], cwd=s_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(['npx', 'tsc'], cwd=s_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(['pkill', '-f', 'bgutil-pot/server/build/main.js'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(['node', f'{s_dir}/build/main.js'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        import urllib.request
+        for _ in range(15):
+            time.sleep(0.5)
+            try:
+                with urllib.request.urlopen('http://127.0.0.1:4416/ping', timeout=1) as r:
+                    if r.status == 200:
+                        _POT_PROVIDER_AVAILABLE = True
+                        print('  ✅ PO-token сервер развернут.'); return True
+            except Exception: continue
+    except Exception as e: print(f'  ⚠️ Ошибка PO-token: {e}')
+    return False
+
 # =========================================================
 # ФИНАЛЬНЫЙ АВТОНОМНЫЙ ОЧЕРЕДНОЙ КЛАСТЕР
 # =========================================================
@@ -282,11 +362,10 @@ def run_autonomous_batch(*, mega_link: str, langs: str = 'en', upload: str = 'ap
     _get_remote_states(profile, sftp_pw)
     print("✅ Успешная авторизация на SFTP.")
 
-    from colab_pipeline import setup_pot_provider
     setup_pot_provider()
     
     shutil.rmtree(SRC_DIR, ignore_errors=True); SRC_DIR.mkdir(parents=True, exist_ok=True)
-    print("📥 Шаг 1: Скачивание всей метаструктуры папки MEGA (только субтитры)...")
+    print("📥 Шаг 1: Скачивание всей метаструктуры папки MEGA...")
     subprocess.run(['mega-get', mega_link, str(SRC_DIR)], check=True)
     print("✅ Структура Меги успешно скопирована локально.")
 
