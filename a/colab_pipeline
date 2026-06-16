@@ -25,7 +25,7 @@ FFMPEG_BIN     = WORKING / 'ffmpeg-bin' / 'bin' / 'ffmpeg'
 FFPROBE_BIN    = WORKING / 'ffmpeg-bin' / 'bin' / 'ffprobe'
 
 DEFAULTS = {
-    # SFTP (Используется для хранения пустых маркеров очереди .lock и .done)
+    # SFTP (Координатор кластера: хранит маркеры очереди .lock и .done)
     'sftp_host': '23.95.52.229',
     'sftp_user': 'root',
     'sftp_port': '22',
@@ -218,6 +218,17 @@ def _secrets():
         return ColabSecretsWrapper()
     except Exception: return None
 
+def tg_send(text: str, silent: bool = False):
+    sec = _secrets()
+    if sec is None: return
+    token = sec.get_secret('TG_BOT_TOKEN')
+    chat  = sec.get_secret('TG_CHAT_ID')
+    if not token or not chat: return
+    try:
+        import requests
+        requests.post(f'https://api.telegram.org/bot{token}/sendMessage', data={'chat_id': chat, 'text': text, 'parse_mode': 'HTML', 'disable_notification': silent}, timeout=15)
+    except Exception: pass
+
 # =========================================================
 # УДАЛЕННЫЙ МЕНЕДЖЕР КООРДИНАЦИИ КЛАСТЕРА (SFTP)
 # =========================================================
@@ -255,6 +266,21 @@ def _remove_lock_marker(p: dict, password: str, marker_name: str):
     bdir = f"{p['sftp_path']}/.blacklist"
     cmd = f'lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" -e "rm -f {bdir}/{marker_name}.lock; quit"'
     subprocess.run(['bash', '-c', cmd], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def clear_all_locks():
+    """Сброс зависших сессий: удаляет все файлы .lock из координационной папки на SFTP."""
+    sec = _secrets()
+    sftp_pw = sec.get_secret('SFTP_PASS') if sec else None
+    if not sftp_pw:
+        print("❌ Секрет SFTP_PASS не найден."); return
+    p = {**DEFAULTS}
+    env = os.environ.copy()
+    env.update(SFTP_PASS=sftp_pw)
+    bdir = f"{p['sftp_path']}/.blacklist"
+    print(f"🧹 Стираю аварийные блокировки (.lock) в {bdir}...")
+    cmd = f'lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" -e "cd {bdir}; rm -f *.lock; quit"'
+    subprocess.run(['bash', '-c', cmd], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print("✅ Очередь бронирования успешно очищена.")
 
 # =========================================================
 # YT-DLP ДВИЖОК СКАЧИВАНИЯ (H.264 HD 1080p/720p)
@@ -303,9 +329,6 @@ def _api_upload(fpath: Path, server, hostings, token, speed_limit_mbps=2, speed_
         time.sleep(5)
     return False
 
-def doctor(upload: str = 'api', logo_dir: Optional[str] = None) -> bool:
-    return True
-
 # =========================================================
 # ФИНАЛЬНЫЙ АВТОНОМНЫЙ ОЧЕРЕДНОЙ КЛАСТЕР
 # =========================================================
@@ -315,7 +338,7 @@ def run_autonomous_batch(*, mega_link: str, langs: str = 'en', upload: str = 'ap
     setup_pot_provider()
     
     shutil.rmtree(SRC_DIR, ignore_errors=True); SRC_DIR.mkdir(parents=True, exist_ok=True)
-    print("📥 Шаг 1: Скачивание всей метаструктуры папки MEGA (только субтитры и конфиги)...")
+    print("📥 Шаг 1: Скачивание структуры папки MEGA (субтитры и списки серий)...")
     subprocess.run(['mega-get', mega_link, str(SRC_DIR)], check=True)
     print("✅ Структура Меги успешно скопирована локально.")
 
@@ -327,16 +350,15 @@ def run_autonomous_batch(*, mega_link: str, langs: str = 'en', upload: str = 'ap
 
     yt_cookies = '/content/yt_cookies.txt' if Path('/content/yt_cookies.txt').exists() else None
 
-    subfolders = sorted([p for p in SRC_DIR.iterdir() if p.is_dir()])
+    # ОПТИМИЗАЦИЯ: Рекурсивный поиск links.txt защищает от любой вложенности папок MEGA
+    links_files = sorted(SRC_DIR.rglob('links.txt'))
     global_pool = []
 
     print("\n🔍 Шаг 2: Анализ подпапок Меги и развертывание плейлистов YouTube...")
-    for folder in subfolders:
+    for links_txt in links_files:
+        folder = links_txt.parent
         name_txt = folder / 'name.txt'
         series_name = name_txt.read_text(encoding='utf-8').strip().splitlines()[0] if name_txt.exists() else folder.name
-        
-        links_txt = folder / 'links.txt'
-        if not links_txt.exists(): continue
         
         links = [line.strip() for line in links_txt.read_text(encoding='utf-8').splitlines() if line.strip() and not line.startswith('#')]
         if not links: continue
@@ -444,7 +466,7 @@ def run_autonomous_batch(*, mega_link: str, langs: str = 'en', upload: str = 'ap
                     print(f"   ✅ Залит на хостинги: {out_f.name}")
                     _convert_lock_to_done(profile, sftp_pw, out_f.name)
                 else:
-                    print(f"   ❌ Сбой заливки API: {out_f.name}.")
+                    print(f"   ❌ Сбой заливки API: {out_f.name}. Освобождаю.")
                     _remove_lock_marker(profile, sftp_pw, out_f.name)
 
         processed_count += 1
