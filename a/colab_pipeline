@@ -128,6 +128,18 @@ def _set_env(profile: dict):
     os.environ['LOGO_IT'] = profile['logo_it'] or f'{ldir}/logo.png'
     os.environ['LOGO_ES'] = profile['logo_es'] or f'{ldir}/logo.png'
 
+def _secrets():
+    """Чтение секретов из панели Google Colab Userdata."""
+    try:
+        from google.colab import userdata
+        class ColabSecretsWrapper:
+            def get_secret(self, name):
+                try: return userdata.get(name)
+                except Exception: return None
+        return ColabSecretsWrapper()
+    except Exception:
+        return None
+
 def tg_send(text: str, silent: bool = False):
     sec = _secrets()
     if sec is None: return
