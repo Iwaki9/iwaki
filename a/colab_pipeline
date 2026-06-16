@@ -117,8 +117,8 @@ def _set_env(profile: dict):
     os.environ['FFMPEG_PATH'] = str(FFMPEG_BIN)
     os.environ['FFPROBE_PATH'] = str(FFPROBE_BIN)
 
-    # ИСПРАВЛЕНИЕ ОШИБКИ CUDA: Принудительно указываем путь к библиотекам NVIDIA драйвера в Colab
-    os.environ['LD_LIBRARY_PATH'] = '/usr/lib64-nvidia:' + os.environ.get('LD_LIBRARY_PATH', '')
+    # Жесткий сквозной проброс драйверов Nvidia
+    os.environ['LD_LIBRARY_PATH'] = '/usr/lib64-nvidia:/usr/local/nvidia/lib64:' + os.environ.get('LD_LIBRARY_PATH', '')
 
     threads = profile.get('ffmpeg_threads', 'auto')
     parallel = int(profile.get('render_parallel', 1))
@@ -153,7 +153,7 @@ def tg_send(text: str, silent: bool = False):
     except Exception: pass
 
 # =========================================================
-# УДАЛЕННЫЙ МЕНЕДЖЕР КООРДИНАЦИИ КЛАСТЕРА
+# УДАЛЕННЫЙ МЕНЕДЖЕР КООРДИНАЦИИ КЛАСТЕРА (Безопасный Heredoc)
 # =========================================================
 def _get_remote_states(p: dict, password: str) -> set[str]:
     env = os.environ.copy()
@@ -283,7 +283,6 @@ def download_youtube_video(url: str, output_dir: Path, cookies: Optional[str] = 
     out_tmpl = str(output_dir / '%(id)s.%(ext)s')
     fmt = f'bestvideo[ext=mp4][vcodec^=avc1][height<={max_height}]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1][height<={max_height}]+bestaudio[ext=m4a]/best[ext=mp4]/best'
     
-    # ИСПРАВЛЕНИЕ ОШИБКИ 403: Принудительно очищаем кэш сигнатур утилиты yt-dlp перед каждым вызовом
     opts = {
         'format': fmt, 
         'outtmpl': out_tmpl, 
@@ -310,56 +309,6 @@ def _api_upload(fpath: Path, server, hostings, token, speed_limit_mbps=2, speed_
         time.sleep(5)
     return False
 
-SETUP_SCRIPT = r'''
-set -e
-test_nvenc() {
-  local FFMPEG_BIN="$1"
-  if [ ! -x "$FFMPEG_BIN" ]; then return 1; fi
-  "$FFMPEG_BIN" -hide_banner -loglevel error -y -f lavfi -i nullsrc=s=320x240:d=0.1 -c:v h264_nvenc /tmp/nvenc_test.mp4 2>/tmp/nvenc_err
-  local rc=$?
-  if [ $rc -eq 0 ] && [ -s /tmp/nvenc_test.mp4 ]; then return 0; fi
-  return $rc
-}
-try_btbn() {
-  local TAG="$1"   
-  local URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-${TAG}-latest-linux64-gpl-${TAG#n}.tar.xz"
-  cd /content
-  rm -rf ffmpeg-bin ffmpeg-${TAG}*
-  if wget -q -O ffmpeg.tar.xz "$URL" && [ -s ffmpeg.tar.xz ]; then
-    tar -xf ffmpeg.tar.xz
-    EXTRACTED=$(ls -d ffmpeg-${TAG}*/ 2>/dev/null | head -1 | tr -d '/')
-    if [ -n "$EXTRACTED" ]; then
-      mv "$EXTRACTED" ffmpeg-bin
-      rm -f ffmpeg.tar.xz
-      if test_nvenc /content/ffmpeg-bin/bin/ffmpeg; then return 0; fi
-    fi
-  fi
-  return 1
-}
-FFMPEG_OK=""
-if try_btbn n8.1; then FFMPEG_OK=1; fi
-if [ -z "$FFMPEG_OK" ] && try_btbn n7.1; then FFMPEG_OK=1; fi
-
-if ! command -v mega-get >/dev/null; then
-  echo '>>> Установка официального консольного клиента MEGA-CMD...'
-  wget -q https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb
-  apt-get update -qq && apt-get install -y -qq "$PWD/megacmd-xUbuntu_22.04_amd64.deb" >/dev/null 2>&1 || true
-  rm -f megacmd-xUbuntu_22.04_amd64.deb
-fi
-
-mkdir -p /content/assets
-wget -q -O "/content/assets/logo riki.png" "https://raw.githubusercontent.com/Iwaki9/iwaki/refs/heads/master/a/logo%20riki.png"
-wget -q -O "/content/assets/logo.png" "https://raw.githubusercontent.com/Iwaki9/iwaki/refs/heads/master/a/logo.png"
-pip install -q pysrt transformers sentencepiece accelerate requests psutil yt-dlp 2>&1 | tail -1
-if ! command -v lftp >/dev/null; then apt-get update -qq && apt-get install -y -qq lftp 2>&1 | tail -1; fi
-echo '>>> SETUP DONE'
-'''
-
-def setup():
-    print('=== SETUP ===')
-    rc = subprocess.call(['bash', '-c', SETUP_SCRIPT])
-    if rc != 0: raise RuntimeError(f'setup failed, exit={rc}')
-
 # =========================================================
 # ФИНАЛЬНЫЙ АВТОНОМНЫЙ ОЧЕРЕДНОЙ КЛАСТЕР
 # =========================================================
@@ -381,7 +330,6 @@ def run_autonomous_batch(*, mega_link: str, langs: str = 'en', upload: str = 'ap
 
     yt_cookies = '/content/yt_cookies.txt' if Path('/content/yt_cookies.txt').exists() else None
 
-    # Поиск файлов links.txt рекурсивно по всему дереву каталогов
     links_files = sorted(SRC_DIR.rglob('links.txt'))
     global_pool = []
 
@@ -462,7 +410,7 @@ def run_autonomous_batch(*, mega_link: str, langs: str = 'en', upload: str = 'ap
             if l_code in task['srts']:
                 shutil.copy2(task['srts'][l_code], SUBS_DIR / f"{marker_base_name}.{l_code}.srt")
 
-        print(f"📥 Конвейер: Скачивание видеопотока с YouTube...")
+        print(f"📥 Конвейер: Скачивание video-потока с YouTube...")
         v_file = download_youtube_video(task['url'], VIDEO_DIR, cookies=yt_cookies, max_height=yt_max_height)
         
         if not v_file or not v_file.exists():
