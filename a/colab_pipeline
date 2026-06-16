@@ -67,7 +67,7 @@ YTDLP_CLIENT_VARIANTS = [None, ['tv'], ['ios'], ['web'], ['mweb']]
 _POT_PROVIDER_AVAILABLE = False
 
 # =========================================================
-# ВСТРОЕННЫЕ ПАРСЕРЫ СЕРИЙ И ЯЗЫКОВ
+# ВСТРОЕННЫЕ СЛОЖНЫЕ ПАРСЕРЫ СЕРИЙ И ЯЗЫКОВ
 # =========================================================
 def parse_episode_number(text: str) -> Optional[int]:
     if not text: return None
@@ -116,8 +116,6 @@ def _set_env(profile: dict):
     os.environ['PATH'] = f'{FFMPEG_BIN.parent}:' + os.environ.get('PATH', '')
     os.environ['FFMPEG_PATH'] = str(FFMPEG_BIN)
     os.environ['FFPROBE_PATH'] = str(FFPROBE_BIN)
-
-    # Жесткий сквозной проброс драйверов Nvidia
     os.environ['LD_LIBRARY_PATH'] = '/usr/lib64-nvidia:/usr/local/nvidia/lib64:' + os.environ.get('LD_LIBRARY_PATH', '')
 
     threads = profile.get('ffmpeg_threads', 'auto')
@@ -153,19 +151,22 @@ def tg_send(text: str, silent: bool = False):
     except Exception: pass
 
 # =========================================================
-# УДАЛЕННЫЙ МЕНЕДЖЕР КООРДИНАЦИИ КЛАСТЕРА (Безопасный Heredoc)
+# УДАЛЕННЫЙ МЕНЕДЖЕР КООРДИНАЦИИ КЛАСТЕРА (Валидация ошибок)
 # =========================================================
 def _get_remote_states(p: dict, password: str) -> set[str]:
     env = os.environ.copy()
     env.update(SFTP_PASS=password)
     bdir = f"{p['sftp_path']}/.blacklist"
     cmd = f'''lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" <<EOF
+    set cmd:fail-exit yes
     mkdir -p "{bdir}"
     cls -1 "{bdir}"
     quit
 EOF'''
     r = subprocess.run(['bash', '-c', cmd], capture_output=True, text=True, env=env)
-    return {line.strip() for line in r.stdout.splitlines() if line.strip()} if r.returncode == 0 else set()
+    if r.returncode != 0:
+        raise RuntimeError(f"❌ Критическая ошибка подключения к SFTP! Проверьте правильность секретной переменной SFTP_PASS и адрес сервера.\nЛог ошибки:\n{r.stderr}")
+    return {line.strip() for line in r.stdout.splitlines() if line.strip()}
 
 def _add_lock_marker(p: dict, password: str, marker_name: str):
     env = os.environ.copy()
@@ -174,12 +175,15 @@ def _add_lock_marker(p: dict, password: str, marker_name: str):
     tmp_f = Path(f"/tmp/lock_node.tmp")
     tmp_f.touch()
     cmd = f'''lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" <<EOF
+    set cmd:fail-exit yes
     mkdir -p "{bdir}"
     put "{tmp_f}" -o "{bdir}/{marker_name}.lock"
     quit
 EOF'''
-    subprocess.run(['bash', '-c', cmd], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    r = subprocess.run(['bash', '-c', cmd], capture_output=True, text=True, env=env)
     tmp_f.unlink(missing_ok=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"❌ Не удалось создать файл блокировки на SFTP:\n{r.stderr}")
 
 def _convert_lock_to_done(p: dict, password: str, marker_name: str):
     env = os.environ.copy()
@@ -188,19 +192,23 @@ def _convert_lock_to_done(p: dict, password: str, marker_name: str):
     tmp_done = Path(f"/tmp/done_node.tmp")
     tmp_done.touch()
     cmd = f'''lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" <<EOF
+    set cmd:fail-exit yes
     mkdir -p "{bdir}"
     rm -f "{bdir}/{marker_name}.lock"
     put "{tmp_done}" -o "{bdir}/{marker_name}.done"
     quit
 EOF'''
-    subprocess.run(['bash', '-c', cmd], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    r = subprocess.run(['bash', '-c', cmd], capture_output=True, text=True, env=env)
     tmp_done.unlink(missing_ok=True)
+    if r.returncode != 0:
+        print(f"⚠️ Ошибка обновления статуса .lock -> .done на SFTP:\n{r.stderr}")
 
 def _remove_lock_marker(p: dict, password: str, marker_name: str):
     env = os.environ.copy()
     env.update(SFTP_PASS=password)
     bdir = f"{p['sftp_path']}/.blacklist"
     cmd = f'''lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" <<EOF
+    set cmd:fail-exit yes
     rm -f "{bdir}/{marker_name}.lock"
     quit
 EOF'''
@@ -210,49 +218,23 @@ def clear_all_locks():
     sec = _secrets()
     sftp_pw = sec.get_secret('SFTP_PASS') if sec else None
     if not sftp_pw:
-        print("❌ Секрет SFTP_PASS не найден."); return
+        print("❌ Секрет SFTP_PASS не найден в настройках блокнота Colab."); return
     p = {**DEFAULTS}
     env = os.environ.copy()
     env.update(SFTP_PASS=sftp_pw)
     bdir = f"{p['sftp_path']}/.blacklist"
     print(f"🧹 Стираю аварийные блокировки (.lock) в {bdir}...")
     cmd = f'''lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" <<EOF
+    set cmd:fail-exit yes
     cd "{bdir}"
     rm -f *.lock
     quit
 EOF'''
-    subprocess.run(['bash', '-c', cmd], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print("✅ Очередь бронирования успешно очищена.")
-
-# =========================================================
-# ПОДДЕРЖКА YOUTUBE PO-TOKEN ДЛЯ ОБХОДА БАНОВ
-# =========================================================
-def setup_pot_provider() -> bool:
-    global _POT_PROVIDER_AVAILABLE
-    if _POT_PROVIDER_AVAILABLE: return True
-    print('🔑 Настройка YouTube PO-token сервера в Colab...')
-    try:
-        subprocess.run(['pip', 'install', '-q', '-U', 'bgutil-ytdlp-pot-provider', 'yt-dlp[default]'], check=True)
-        repo_dir = '/content/bgutil-pot'
-        if not Path(repo_dir).exists():
-            subprocess.run(['git', 'clone', '-q', '--depth', '1', 'https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git', repo_dir], check=True)
-        s_dir = f'{repo_dir}/server'
-        if not Path(f'{s_dir}/build').exists():
-            subprocess.run(['npm', 'install', '--silent'], cwd=s_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(['npx', 'tsc'], cwd=s_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(['pkill', '-f', 'bgutil-pot/server/build/main.js'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.Popen(['node', f'{s_dir}/build/main.js'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        import urllib.request
-        for _ in range(15):
-            time.sleep(0.5)
-            try:
-                with urllib.request.urlopen('http://127.0.0.1:4416/ping', timeout=1) as r:
-                    if r.status == 200:
-                        _POT_PROVIDER_AVAILABLE = True
-                        print('  ✅ PO-token сервер успешно развернут локально.'); return True
-            except Exception: continue
-    except Exception as e: print(f'  ⚠️ Не удалось поднять токен-сервер: {e}')
-    return False
+    r = subprocess.run(['bash', '-c', cmd], capture_output=True, text=True, env=env)
+    if r.returncode != 0:
+        print(f"❌ Не удалось очистить очередь! Неверный пароль SFTP или сервер недоступен.\nДетали ошибки:\n{r.stderr}")
+    else:
+        print("✅ Очередь бронирования успешно очищена.")
 
 # =========================================================
 # YT-DLP ДВИЖОК СКАЧИВАНИЯ (H.264 HD 1080p/720p)
@@ -309,62 +291,24 @@ def _api_upload(fpath: Path, server, hostings, token, speed_limit_mbps=2, speed_
         time.sleep(5)
     return False
 
-SETUP_SCRIPT = r'''
-set -e
-test_nvenc() {
-  local FFMPEG_BIN="$1"
-  if [ ! -x "$FFMPEG_BIN" ]; then return 1; fi
-  "$FFMPEG_BIN" -hide_banner -loglevel error -y -f lavfi -i nullsrc=s=320x240:d=0.1 -c:v h264_nvenc /tmp/nvenc_test.mp4 2>/tmp/nvenc_err
-  local rc=$?
-  if [ $rc -eq 0 ] && [ -s /tmp/nvenc_test.mp4 ]; then return 0; fi
-  return $rc
-}
-try_btbn() {
-  local TAG="$1"   
-  local URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-${TAG}-latest-linux64-gpl-${TAG#n}.tar.xz"
-  cd /content
-  rm -rf ffmpeg-bin ffmpeg-${TAG}*
-  if wget -q -O ffmpeg.tar.xz "$URL" && [ -s ffmpeg.tar.xz ]; then
-    tar -xf ffmpeg.tar.xz
-    EXTRACTED=$(ls -d ffmpeg-${TAG}*/ 2>/dev/null | head -1 | tr -d '/')
-    if [ -n "$EXTRACTED" ]; then
-      mv "$EXTRACTED" ffmpeg-bin
-      rm -f ffmpeg.tar.xz
-      if test_nvenc /content/ffmpeg-bin/bin/ffmpeg; then return 0; fi
-    fi
-  fi
-  return 1
-}
-FFMPEG_OK=""
-if try_btbn n8.1; then FFMPEG_OK=1; fi
-if [ -z "$FFMPEG_OK" ] && try_btbn n7.1; then FFMPEG_OK=1; fi
-
-if ! command -v mega-get >/dev/null; then
-  echo '>>> Установка официального консольного клиента MEGA-CMD...'
-  wget -q https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb
-  apt-get update -qq && apt-get install -y -qq "$PWD/megacmd-xUbuntu_22.04_amd64.deb" >/dev/null 2>&1 || true
-  rm -f megacmd-xUbuntu_22.04_amd64.deb
-fi
-
-mkdir -p /content/assets
-wget -q -O "/content/assets/logo riki.png" "https://raw.githubusercontent.com/Iwaki9/iwaki/refs/heads/master/a/logo%20riki.png"
-wget -q -O "/content/assets/logo.png" "https://raw.githubusercontent.com/Iwaki9/iwaki/refs/heads/master/a/logo.png"
-pip install -q pysrt transformers sentencepiece accelerate requests psutil yt-dlp 2>&1 | tail -1
-if ! command -v lftp >/dev/null; then apt-get update -qq && apt-get install -y -qq lftp 2>&1 | tail -1; fi
-echo '>>> SETUP DONE'
-'''
-
-def setup():
-    print('=== SETUP ===')
-    rc = subprocess.call(['bash', '-c', SETUP_SCRIPT])
-    if rc != 0: raise RuntimeError(f'setup failed, exit={rc}')
-
 # =========================================================
 # ФИНАЛЬНЫЙ АВТОНОМНЫЙ ОЧЕРЕДНОЙ КЛАСТЕР
 # =========================================================
 def run_autonomous_batch(*, mega_link: str, langs: str = 'en', upload: str = 'api', yt_max_height: int = 1080, **overrides):
     profile = {**DEFAULTS, **overrides}
     _ensure_dirs()
+    
+    # Жесткая проверка связи со старту
+    sec = _secrets()
+    sftp_pw = sec.get_secret('SFTP_PASS') if sec else None
+    token = sec.get_secret('UPLOAD_API_TOKEN') if sec else None
+    if not sftp_pw: raise RuntimeError("Секрет SFTP_PASS необходим для координации кластера!")
+    
+    print("Проверка подключения к SFTP...")
+    _get_remote_states(profile, sftp_pw)
+    print("✅ Успешная авторизация на SFTP.")
+
+    from colab_pipeline import setup_pot_provider
     setup_pot_provider()
     
     shutil.rmtree(SRC_DIR, ignore_errors=True); SRC_DIR.mkdir(parents=True, exist_ok=True)
@@ -373,11 +317,6 @@ def run_autonomous_batch(*, mega_link: str, langs: str = 'en', upload: str = 'ap
     print("✅ Структура Меги успешно скопирована локально.")
 
     script = _ensure_script(profile['logo_dir'])
-    sec = _secrets()
-    sftp_pw = sec.get_secret('SFTP_PASS') if sec else None
-    token = sec.get_secret('UPLOAD_API_TOKEN') if sec else None
-    if not sftp_pw: raise RuntimeError("SFTP_PASS необходим!")
-
     yt_cookies = '/content/yt_cookies.txt' if Path('/content/yt_cookies.txt').exists() else None
 
     links_files = sorted(SRC_DIR.rglob('links.txt'))
