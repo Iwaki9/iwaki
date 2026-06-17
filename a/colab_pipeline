@@ -229,8 +229,13 @@ def clear_all_locks():
     if locks_before:
         print(f"   {', '.join(sorted(locks_before))}")
 
-    # 2. Удаление
-    r = _lftp_run(p, sftp_pw, f'mkdir -pf "{bdir}"\ncd "{bdir}"\nrm -f *.lock')
+    if not locks_before:
+        print("✅ Lock-файлов не было — нечего удалять.")
+        return
+
+    # 2. Удаление по одному файлу (lftp не всегда раскрывает *.lock в rm)
+    rm_commands = '\n'.join(f'rm -f "{fname}"' for fname in sorted(locks_before))
+    r = _lftp_run(p, sftp_pw, f'cd "{bdir}"\n{rm_commands}')
 
     if r.returncode != 0:
         print(f"❌ Ошибка очистки locks. RC={r.returncode}")
@@ -241,14 +246,11 @@ def clear_all_locks():
     # 3. Проверка после удаления
     r_list2 = _lftp_run(p, sftp_pw, f'cd "{bdir}"\ncls -1 *.lock')
     locks_after = {line.strip() for line in r_list2.stdout.splitlines() if line.strip()} if r_list2.returncode == 0 else set()
-    removed = len(locks_before - locks_after)
 
     if locks_after:
         print(f"⚠️ Lock-файлы остались после удаления: {', '.join(sorted(locks_after))}")
-    elif removed == 0:
-        print("✅ Lock-файлов не было — нечего удалять.")
     else:
-        print(f"✅ Удалено lock-файлов: {removed}.")
+        print(f"✅ Удалено lock-файлов: {len(locks_before)}.")
 
 # =========================================================
 # ПОДДЕРЖКА YOUTUBE PO-TOKEN ДЛЯ ОБХОДА БАНОВ
