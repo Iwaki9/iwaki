@@ -162,6 +162,7 @@ def _lftp_run(p: dict, password: str, commands: str) -> subprocess.CompletedProc
 set sftp:auto-confirm yes
 set net:max-retries 1
 set net:timeout 10
+set cmd:fail-exit yes
 {commands}
 quit
 EOF'''
