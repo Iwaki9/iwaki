@@ -3,6 +3,7 @@ import asyncio
 import os
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Union, Dict, Tuple
@@ -311,6 +312,33 @@ def _api_upload(fpath: Path, server, hostings, token, speed_limit_mbps=2, speed_
         time.sleep(5)
     return False
 
+
+def _upload_worker(profile: dict, sftp_pw: str, token: Optional[str], out_f: Path, state_dir: Path, in_progress_lock: threading.Lock, in_progress_names: set[str]):
+    try:
+        ok = _api_upload(
+            out_f,
+            profile['api_server'],
+            profile['api_hostings'],
+            token,
+            profile['api_speed_limit_mbps'],
+            profile['api_speed_time_sec'],
+            profile['api_max_retries']
+        )
+        if ok:
+            print(f"   ✅ Залит на хостинги: {out_f.name}")
+            _convert_lock_to_done(profile, sftp_pw, out_f.name)
+        else:
+            print(f"   ❌ Сбой заливки API: {out_f.name}. Возврат очереди.")
+            _remove_lock_marker(profile, sftp_pw, out_f.name)
+    finally:
+        try:
+            done_marker = state_dir / f"{out_f.name}.done"
+            done_marker.unlink(missing_ok=True)
+        except Exception:
+            pass
+        with in_progress_lock:
+            in_progress_names.discard(out_f.name)
+
 SETUP_SCRIPT = r'''
 set -e
 test_nvenc() {
@@ -476,29 +504,60 @@ def run_autonomous_batch(*, mega_link: str, langs: str = 'en', upload: str = 'ap
         print("⚙️ Конвейер: Старт рендеринга хардсаба...")
         cmd = ['python', '-u', str(script), '--once', '--video-dir', str(VIDEO_DIR), '--subtitle-dir', str(SUBS_DIR), '--logo-dir', profile['logo_dir'], '--output-dir', str(OUT_DIR), '--log-dir', str(LOG_DIR), '--dest-langs', ','.join(target_langs_to_render), '--encoder', profile['encoder'], '--naming', 'stem', '--skip-translation']
         
+        state_dir = OUT_DIR / '_job_state'
+        upload_threads: List[threading.Thread] = []
+        in_progress_lock = threading.Lock()
+        in_progress_names: set[str] = set()
+
+        def _poll_and_upload_finished():
+            for done_path in sorted(state_dir.glob('*.done')):
+                out_name = done_path.stem
+                with in_progress_lock:
+                    if out_name in in_progress_names:
+                        continue
+                    in_progress_names.add(out_name)
+                out_f = OUT_DIR / out_name
+                if not out_f.exists():
+                    with in_progress_lock:
+                        in_progress_names.discard(out_name)
+                    continue
+                print(f"📤 Конвейер: Начинаю заливку {out_f.name} на API-сервер (параллельно с рендером)...")
+                t = threading.Thread(
+                    target=_upload_worker,
+                    args=(profile, sftp_pw, token, out_f, state_dir, in_progress_lock, in_progress_names),
+                    daemon=False
+                )
+                t.start()
+                upload_threads.append(t)
+
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        last_poll = time.time()
         while True:
             line = proc.stdout.readline()
-            if not line: break
-            print(line, end='', flush=True)
+            if line:
+                print(line, end='', flush=True)
+            
+            now = time.time()
+            if now - last_poll >= 5:
+                _poll_and_upload_finished()
+                last_poll = now
+            
+            if not line:
+                break
+
         proc.wait()
+        _poll_and_upload_finished()
+
+        for t in upload_threads:
+            t.join()
 
         if proc.returncode != 0:
-            print("❌ Ошибка сборки. Снимаю лок-маркеры.")
-            for l_code in target_langs_to_render: _remove_lock_marker(profile, sftp_pw, f"{marker_base_name}.{l_code}.mp4")
-            continue
-
-        outputs = sorted(p for p in OUT_DIR.glob('*.mp4') if p.is_file())
-        if outputs:
-            print(f"📤 Конвейер: Заливка на API-сервер...")
-            for out_f in outputs:
-                ok = _api_upload(out_f, profile['api_server'], profile['api_hostings'], token, profile['api_speed_limit_mbps'], profile['api_speed_time_sec'], profile['api_max_retries'])
-                if ok:
-                    print(f"   ✅ Залит на хостинги: {out_f.name}")
-                    _convert_lock_to_done(profile, sftp_pw, out_f.name)
-                else:
-                    print(f"   ❌ Сбой заливки API: {out_f.name}. Возврат очереди.")
-                    _remove_lock_marker(profile, sftp_pw, out_f.name)
+            print("❌ Ошибка сборки. Снимаю лок-маркеры для незавершенных языков.")
+            states = _get_remote_states(profile, sftp_pw)
+            for l_code in target_langs_to_render:
+                out_name = f"{marker_base_name}.{l_code}.mp4"
+                if f"{out_name}.done" not in states:
+                    _remove_lock_marker(profile, sftp_pw, out_name)
 
         processed_count += 1
         shutil.rmtree(VIDEO_DIR, ignore_errors=True)
