@@ -171,7 +171,7 @@ EOF'''
 
 def _get_remote_states(p: dict, password: str) -> set[str]:
     bdir = f"{p['sftp_path']}/.blacklist"
-    r = _lftp_run(p, password, f'mkdir -p "{bdir}"\ncd "{bdir}"\ncls -1')
+    r = _lftp_run(p, password, f'mkdir -pf "{bdir}"\ncd "{bdir}"\ncls -1')
     if r.returncode != 0:
         print(f"⚠️ _get_remote_states failed: {r.stderr.strip()}")
         return set()
@@ -182,7 +182,7 @@ def _add_lock_marker(p: dict, password: str, marker_name: str):
     bdir = f"{p['sftp_path']}/.blacklist"
     tmp_f = Path(f"/tmp/lock_node.tmp")
     tmp_f.touch()
-    r = _lftp_run(p, password, f'mkdir -p "{bdir}"\nput "{tmp_f}" -o "{bdir}/{marker_name}.lock"')
+    r = _lftp_run(p, password, f'mkdir -pf "{bdir}"\nput "{tmp_f}" -o "{bdir}/{marker_name}.lock"')
     tmp_f.unlink(missing_ok=True)
     if r.returncode != 0:
         print(f"⚠️ _add_lock_marker failed for {marker_name}: {r.stderr.strip()}")
@@ -192,7 +192,7 @@ def _convert_lock_to_done(p: dict, password: str, marker_name: str):
     bdir = f"{p['sftp_path']}/.blacklist"
     tmp_done = Path(f"/tmp/done_node.tmp")
     tmp_done.touch()
-    r = _lftp_run(p, password, f'mkdir -p "{bdir}"\nrm -f "{bdir}/{marker_name}.lock"\nput "{tmp_done}" -o "{bdir}/{marker_name}.done"')
+    r = _lftp_run(p, password, f'mkdir -pf "{bdir}"\nrm -f "{bdir}/{marker_name}.lock"\nput "{tmp_done}" -o "{bdir}/{marker_name}.done"')
     tmp_done.unlink(missing_ok=True)
     if r.returncode != 0:
         print(f"⚠️ _convert_lock_to_done failed for {marker_name}: {r.stderr.strip()}")
@@ -216,7 +216,7 @@ def clear_all_locks():
     bdir = f"{p['sftp_path']}/.blacklist"
     print(f"🧹 Стираю аварийные блокировки (.lock) в {bdir}...")
 
-    r = _lftp_run(p, sftp_pw, f'mkdir -p "{bdir}"\ncd "{bdir}"\nrm -f *.lock')
+    r = _lftp_run(p, sftp_pw, f'mkdir -pf "{bdir}"\ncd "{bdir}"\nrm -f *.lock')
 
     if r.returncode != 0:
         print(f"❌ Ошибка очистки locks. RC={r.returncode}")
