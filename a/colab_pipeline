@@ -142,16 +142,37 @@ def _secrets():
         return ColabSecretsWrapper()
     except Exception: return None
 
-def tg_send(text: str, silent: bool = False):
+_TG_NOTIFIED_MISSING = False
+
+def tg_send(text: str, silent: bool = False) -> bool:
+    global _TG_NOTIFIED_MISSING
     sec = _secrets()
-    if sec is None: return
+    if sec is None:
+        if not _TG_NOTIFIED_MISSING:
+            print("⚠️ Telegram: секреты недоступны (не в Colab?). Уведомления отключены.")
+            _TG_NOTIFIED_MISSING = True
+        return False
     token = sec.get_secret('TG_BOT_TOKEN')
-    chat  = sec.get_secret('TG_CHAT_ID')
-    if not token or not chat: return
+    chat = sec.get_secret('TG_CHAT_ID')
+    if not token or not chat:
+        if not _TG_NOTIFIED_MISSING:
+            print("⚠️ Telegram: секреты TG_BOT_TOKEN/TG_CHAT_ID не найдены. Уведомления отключены.")
+            _TG_NOTIFIED_MISSING = True
+        return False
     try:
         import requests
-        requests.post(f'https://api.telegram.org/bot{token}/sendMessage', data={'chat_id': chat, 'text': text, 'parse_mode': 'HTML', 'disable_notification': silent}, timeout=15)
-    except Exception: pass
+        r = requests.post(
+            f'https://api.telegram.org/bot{token}/sendMessage',
+            data={'chat_id': chat, 'text': text, 'parse_mode': 'HTML', 'disable_notification': silent},
+            timeout=15
+        )
+        if r.status_code != 200:
+            print(f"⚠️ Telegram не отправлен: HTTP {r.status_code} — {r.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"⚠️ Telegram не отправлен: {e}")
+        return False
 
 # =========================================================
 # УДАЛЕННЫЙ МЕНЕДЖЕР КООРДИНАЦИИ КЛАСТЕРА (Безопасный Heredoc)
@@ -338,7 +359,7 @@ def _api_upload(fpath: Path, server, hostings, token, speed_limit_mbps=2, speed_
     return False
 
 
-def _upload_worker(profile: dict, sftp_pw: str, token: Optional[str], out_f: Path, state_dir: Path, in_progress_lock: threading.Lock, in_progress_names: set[str]):
+def _upload_worker(profile: dict, sftp_pw: str, token: Optional[str], out_f: Path, state_dir: Path, in_progress_lock: threading.Lock, in_progress_names: set[str], series_name: str = "", ep: Optional[int] = None):
     try:
         ok = _api_upload(
             out_f,
@@ -351,9 +372,11 @@ def _upload_worker(profile: dict, sftp_pw: str, token: Optional[str], out_f: Pat
         )
         if ok:
             print(f"   ✅ Залит на хостинги: {out_f.name}")
+            tg_send(f'✅ Залит файл <b>{out_f.name}</b>\nСерия {ep} — <b>{series_name}</b>')
             _convert_lock_to_done(profile, sftp_pw, out_f.name)
         else:
             print(f"   ❌ Сбой заливки API: {out_f.name}. Возврат очереди.")
+            tg_send(f'❌ Сбой заливки API для <b>{out_f.name}</b>\nСерия {ep} — <b>{series_name}</b>')
             _remove_lock_marker(profile, sftp_pw, out_f.name)
     finally:
         try:
@@ -482,6 +505,12 @@ def run_autonomous_batch(*, mega_link: str, langs: str = 'en', upload: str = 'ap
     print(f"\n🎯 Анализ завершен. Всего в глобальной очереди YouTube обнаружено: {len(global_pool)} серий.")
     tg_send(f'🚀 Сервер Colab подключился к распределенной очереди.\nВсего в пуле: <b>{len(global_pool)} серий</b>')
 
+    if not global_pool:
+        print("🏁 Очередь пуста — нечего обрабатывать. Завершаю сессию.")
+        tg_send(f'🏁 Очередь пуста. Нода завершает работу без задач.\nСделано: <b>0 серий</b>')
+        stop()
+        return
+
     processed_count = 0
     for task in global_pool:
         safe_series = re.sub(r'[<>:"/\\|?*]', '_', task['series_name']).strip()
@@ -505,6 +534,7 @@ def run_autonomous_batch(*, mega_link: str, langs: str = 'en', upload: str = 'ap
             continue 
 
         print(f"\n🔒 Бронирую серию {task['ep']} сериала '{task['series_name']}'...")
+        tg_send(f'🔒 Бронирую серию {task["ep"]} сериала <b>{task["series_name"]}</b>\nЯзыки: {", ".join(target_langs_to_render)}')
         for l_code in target_langs_to_render:
             _add_lock_marker(profile, sftp_pw, f"{marker_base_name}.{l_code}.mp4")
 
@@ -520,6 +550,7 @@ def run_autonomous_batch(*, mega_link: str, langs: str = 'en', upload: str = 'ap
         
         if not v_file or not v_file.exists():
             print("❌ Сбой скачивания с YouTube. Снимаю бронь ноды.")
+            tg_send(f'❌ Сбой скачивания с YouTube серии {task["ep"]} <b>{task["series_name"]}</b>. Бронь снята.')
             for l_code in target_langs_to_render: _remove_lock_marker(profile, sftp_pw, f"{marker_base_name}.{l_code}.mp4")
             continue
 
@@ -527,6 +558,7 @@ def run_autonomous_batch(*, mega_link: str, langs: str = 'en', upload: str = 'ap
         v_file.rename(target_video_path)
 
         print("⚙️ Конвейер: Старт рендеринга хардсаба...")
+        tg_send(f'⚙️ Начинаю рендер серии {task["ep"]} <b>{task["series_name"]}</b>\nЯзыки: {", ".join(target_langs_to_render)}')
         cmd = ['python', '-u', str(script), '--once', '--video-dir', str(VIDEO_DIR), '--subtitle-dir', str(SUBS_DIR), '--logo-dir', profile['logo_dir'], '--output-dir', str(OUT_DIR), '--log-dir', str(LOG_DIR), '--dest-langs', ','.join(target_langs_to_render), '--encoder', profile['encoder'], '--naming', 'stem', '--skip-translation']
         
         state_dir = OUT_DIR / '_job_state'
@@ -549,7 +581,7 @@ def run_autonomous_batch(*, mega_link: str, langs: str = 'en', upload: str = 'ap
                 print(f"📤 Конвейер: Начинаю заливку {out_f.name} на API-сервер (параллельно с рендером)...")
                 t = threading.Thread(
                     target=_upload_worker,
-                    args=(profile, sftp_pw, token, out_f, state_dir, in_progress_lock, in_progress_names),
+                    args=(profile, sftp_pw, token, out_f, state_dir, in_progress_lock, in_progress_names, task['series_name'], task['ep']),
                     daemon=False
                 )
                 t.start()
@@ -578,18 +610,22 @@ def run_autonomous_batch(*, mega_link: str, langs: str = 'en', upload: str = 'ap
 
         if proc.returncode != 0:
             print("❌ Ошибка сборки. Снимаю лок-маркеры для незавершенных языков.")
+            tg_send(f'❌ Ошибка рендера серии {task["ep"]} <b>{task["series_name"]}</b>. Незавершенные языки возвращены в очередь.')
             states = _get_remote_states(profile, sftp_pw)
             for l_code in target_langs_to_render:
                 out_name = f"{marker_base_name}.{l_code}.mp4"
                 if f"{out_name}.done" not in states:
                     _remove_lock_marker(profile, sftp_pw, out_name)
+        else:
+            tg_send(f'✅ Серия {task["ep"]} <b>{task["series_name"]}</b> обработана.\nВсего сделано: <b>{processed_count + 1} серий</b>')
 
         processed_count += 1
         shutil.rmtree(VIDEO_DIR, ignore_errors=True)
         shutil.rmtree(OUT_DIR, ignore_errors=True)
 
     print(f"\n🏁 Очередь пуста. Нода завершила работу. Сделано: {processed_count} серий.")
-    tg_send(f'🏁 Нода кластера выполнила задачи очереди.')
+    tg_send(f'🏁 Нода завершила работу.\nВсего сделано: <b>{processed_count} серий</b>')
+    stop()
 
 def stop():
     try:
