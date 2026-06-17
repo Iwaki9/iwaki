@@ -155,73 +155,74 @@ def tg_send(text: str, silent: bool = False):
 # =========================================================
 # УДАЛЕННЫЙ МЕНЕДЖЕР КООРДИНАЦИИ КЛАСТЕРА (Безопасный Heredoc)
 # =========================================================
-def _get_remote_states(p: dict, password: str) -> set[str]:
+def _lftp_run(p: dict, password: str, commands: str) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env.update(SFTP_PASS=password)
-    bdir = f"{p['sftp_path']}/.blacklist"
-    cmd = f'''lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" <<EOF
-    mkdir -p "{bdir}"
-    cls -1 "{bdir}"
-    quit
+    cmd = f'''lftp -u "{p['sftp_user']},$SFTP_PASS" -p "{p['sftp_port']}" "sftp://{p['sftp_host']}" <<EOF
+set sftp:auto-confirm yes
+set net:max-retries 1
+set net:timeout 10
+{commands}
+quit
 EOF'''
-    r = subprocess.run(['bash', '-c', cmd], capture_output=True, text=True, env=env)
-    return {line.strip() for line in r.stdout.splitlines() if line.strip()} if r.returncode == 0 else set()
+    return subprocess.run(['bash', '-c', cmd], env=env, capture_output=True, text=True)
+
+
+def _get_remote_states(p: dict, password: str) -> set[str]:
+    bdir = f"{p['sftp_path']}/.blacklist"
+    r = _lftp_run(p, password, f'mkdir -p "{bdir}"\ncd "{bdir}"\ncls -1')
+    if r.returncode != 0:
+        print(f"⚠️ _get_remote_states failed: {r.stderr.strip()}")
+        return set()
+    return {line.strip() for line in r.stdout.splitlines() if line.strip()}
+
 
 def _add_lock_marker(p: dict, password: str, marker_name: str):
-    env = os.environ.copy()
-    env.update(SFTP_PASS=password)
     bdir = f"{p['sftp_path']}/.blacklist"
     tmp_f = Path(f"/tmp/lock_node.tmp")
     tmp_f.touch()
-    cmd = f'''lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" <<EOF
-    mkdir -p "{bdir}"
-    put "{tmp_f}" -o "{bdir}/{marker_name}.lock"
-    quit
-EOF'''
-    subprocess.run(['bash', '-c', cmd], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    r = _lftp_run(p, password, f'mkdir -p "{bdir}"\nput "{tmp_f}" -o "{bdir}/{marker_name}.lock"')
     tmp_f.unlink(missing_ok=True)
+    if r.returncode != 0:
+        print(f"⚠️ _add_lock_marker failed for {marker_name}: {r.stderr.strip()}")
+
 
 def _convert_lock_to_done(p: dict, password: str, marker_name: str):
-    env = os.environ.copy()
-    env.update(SFTP_PASS=password)
     bdir = f"{p['sftp_path']}/.blacklist"
     tmp_done = Path(f"/tmp/done_node.tmp")
     tmp_done.touch()
-    cmd = f'''lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" <<EOF
-    mkdir -p "{bdir}"
-    rm -f "{bdir}/{marker_name}.lock"
-    put "{tmp_done}" -o "{bdir}/{marker_name}.done"
-    quit
-EOF'''
-    subprocess.run(['bash', '-c', cmd], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    r = _lftp_run(p, password, f'mkdir -p "{bdir}"\nrm -f "{bdir}/{marker_name}.lock"\nput "{tmp_done}" -o "{bdir}/{marker_name}.done"')
     tmp_done.unlink(missing_ok=True)
+    if r.returncode != 0:
+        print(f"⚠️ _convert_lock_to_done failed for {marker_name}: {r.stderr.strip()}")
+
 
 def _remove_lock_marker(p: dict, password: str, marker_name: str):
-    env = os.environ.copy()
-    env.update(SFTP_PASS=password)
     bdir = f"{p['sftp_path']}/.blacklist"
-    cmd = f'''lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" <<EOF
-    rm -f "{bdir}/{marker_name}.lock"
-    quit
-EOF'''
-    subprocess.run(['bash', '-c', cmd], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    r = _lftp_run(p, password, f'rm -f "{bdir}/{marker_name}.lock"')
+    if r.returncode != 0:
+        print(f"⚠️ _remove_lock_marker failed for {marker_name}: {r.stderr.strip()}")
+
 
 def clear_all_locks():
     sec = _secrets()
     sftp_pw = sec.get_secret('SFTP_PASS') if sec else None
     if not sftp_pw:
-        print("❌ Секрет SFTP_PASS не найден."); return
+        print("❌ Секрет SFTP_PASS не найден.")
+        return
+
     p = {**DEFAULTS}
-    env = os.environ.copy()
-    env.update(SFTP_PASS=sftp_pw)
     bdir = f"{p['sftp_path']}/.blacklist"
     print(f"🧹 Стираю аварийные блокировки (.lock) в {bdir}...")
-    cmd = f'''lftp -u "{p["sftp_user"]},$SFTP_PASS" -p "{p["sftp_port"]}" "sftp://{p["sftp_host"]}" <<EOF
-    cd "{bdir}"
-    rm -f *.lock
-    quit
-EOF'''
-    subprocess.run(['bash', '-c', cmd], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    r = _lftp_run(p, sftp_pw, f'mkdir -p "{bdir}"\ncd "{bdir}"\nrm -f *.lock')
+
+    if r.returncode != 0:
+        print(f"❌ Ошибка очистки locks. RC={r.returncode}")
+        print(f"STDERR: {r.stderr.strip()}")
+        print(f"STDOUT: {r.stdout.strip()}")
+        return
+
     print("✅ Очередь бронирования успешно очищена.")
 
 # =========================================================
