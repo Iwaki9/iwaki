@@ -217,6 +217,19 @@ def clear_all_locks():
     bdir = f"{p['sftp_path']}/.blacklist"
     print(f"🧹 Стираю аварийные блокировки (.lock) в {bdir}...")
 
+    # 1. Список lock-файлов до удаления
+    r_list = _lftp_run(p, sftp_pw, f'mkdir -pf "{bdir}"\ncd "{bdir}"\ncls -1 *.lock')
+    if r_list.returncode != 0:
+        print(f"❌ Не удалось получить список locks. RC={r_list.returncode}")
+        print(f"STDERR: {r_list.stderr.strip()}")
+        print(f"STDOUT: {r_list.stdout.strip()}")
+        return
+    locks_before = {line.strip() for line in r_list.stdout.splitlines() if line.strip()}
+    print(f"   Найдено lock-файлов: {len(locks_before)}")
+    if locks_before:
+        print(f"   {', '.join(sorted(locks_before))}")
+
+    # 2. Удаление
     r = _lftp_run(p, sftp_pw, f'mkdir -pf "{bdir}"\ncd "{bdir}"\nrm -f *.lock')
 
     if r.returncode != 0:
@@ -225,7 +238,17 @@ def clear_all_locks():
         print(f"STDOUT: {r.stdout.strip()}")
         return
 
-    print("✅ Очередь бронирования успешно очищена.")
+    # 3. Проверка после удаления
+    r_list2 = _lftp_run(p, sftp_pw, f'cd "{bdir}"\ncls -1 *.lock')
+    locks_after = {line.strip() for line in r_list2.stdout.splitlines() if line.strip()} if r_list2.returncode == 0 else set()
+    removed = len(locks_before - locks_after)
+
+    if locks_after:
+        print(f"⚠️ Lock-файлы остались после удаления: {', '.join(sorted(locks_after))}")
+    elif removed == 0:
+        print("✅ Lock-файлов не было — нечего удалять.")
+    else:
+        print(f"✅ Удалено lock-файлов: {removed}.")
 
 # =========================================================
 # ПОДДЕРЖКА YOUTUBE PO-TOKEN ДЛЯ ОБХОДА БАНОВ
