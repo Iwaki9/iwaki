@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "roles": {
+    "лесник": {"pack": "lesnik_tulup_v1"},
+    "рассказчик": {"pack": "rasskazchik_street_v3"}
+  },
+  "cues": [
+    {
+      "id": "лесник-первый-ответ",
+      "kind": "speech",
+      "role": "лесник",
+      "text": "Знаю, что не спишь",
+      "paragraph": 9,
+      "animation": "keep"
+    },
+    {
+      "id": "лесник-предложение-еды",
+      "kind": "speech",
+      "role": "лесник",
+      "text": "Жри давай. Остынет — нового греть не стану",
+      "paragraph": 9,
+      "animation": "auto",
+      "action": "указывает",
+      "at": "Жри давай",
+      "motion_duration": 1.5
+    },
+    {
+      "id": "рассказчик-вопрос",
+      "kind": "speech",
+      "role": "рассказчик",
+      "text": "Кто вы такой?! Отпустите меня!",
+      "paragraph": 11,
+      "animation": "auto"
+    },
+    {
+      "id": "рассказчик-спасатели",
+      "kind": "speech",
+      "role": "рассказчик",
+      "text": "Меня ищут! Спасатели уже прочёсывают лес!",
+      "paragraph": 11,
+      "animation": "keep"
+    }
+  ]
+}
