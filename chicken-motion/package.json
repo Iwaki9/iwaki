@@ -1,0 +1,15 @@
+{
+  "name": "chicken-pecking-grains",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0",
+  "description": "Motion study: курица клюёт зёрна — 8-секундная петля",
+  "scripts": {
+    "render": "node src/render.mjs --fps 30 --out /tmp/chicken-frames",
+    "export": "bash src/export.sh",
+    "build": "node src/build-html.mjs"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^0.1.60"
+  }
+}
